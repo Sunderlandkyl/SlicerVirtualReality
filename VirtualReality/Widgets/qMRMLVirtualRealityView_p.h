@@ -92,6 +92,7 @@ public:
   vtkMRMLVirtualRealityViewNode::XRBackendType currentXRBackend() const;
   bool currentXRBackendRemotingEnabled() const;
   std::string currentXRBackendRemotingIPAddress() const;
+  bool currentXRBackendPassthroughEnabled() const;
 
 public slots:
   void updateWidgetFromMRML();

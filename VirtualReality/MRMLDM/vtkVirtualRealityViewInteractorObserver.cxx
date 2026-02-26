@@ -94,6 +94,7 @@ void vtkVirtualRealityViewInteractorObserver::SetInteractor(vtkRenderWindowInter
     interactor->AddObserver(vtkCommand::PositionProp3DEvent, this->EventCallbackCommand, priority);
     interactor->AddObserver(vtkCommand::Clip3DEvent, this->EventCallbackCommand, priority);
     interactor->AddObserver(vtkCommand::Elevation3DEvent, this->EventCallbackCommand, priority);
+    interactor->AddObserver(vtkCommand::LeftButtonPressEvent, this->EventCallbackCommand, priority);
 
     /// Touch gesture interaction events
     // Already observed in vtkMRMLViewInteractorStyle

@@ -23,6 +23,19 @@
 
 // VTK includes
 #include <vtkObjectFactory.h>
+#include <vtkOpenXRRenderWindowInteractor.h>
 
 //----------------------------------------------------------------------------
 vtkStandardNewMacro(vtkVirtualRealityViewOpenXRInteractorStyle);
+
+//------------------------------------------------------------------------------
+void vtkVirtualRealityViewOpenXRInteractorStyle::SetupActions(vtkRenderWindowInteractor* iren)
+{
+  Superclass::SetupActions(iren);
+
+  vtkOpenXRRenderWindowInteractor* oiren = vtkOpenXRRenderWindowInteractor::SafeDownCast(iren);
+  if (oiren)
+  {
+    oiren->AddAction("triggeraction", vtkCommand::LeftButtonPressEvent, false);
+  }
+}

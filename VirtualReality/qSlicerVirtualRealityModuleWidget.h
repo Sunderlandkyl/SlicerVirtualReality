@@ -57,6 +57,8 @@ public slots:
   // OpenXRRemoting
   void setRemotingEnabled(bool);
   void onPlayerIPAddressLineEditEditingFinished();
+  // Passthrough
+  void setPassthroughEnabled(bool);
 
 protected slots:
   void updateWidgetFromMRML();

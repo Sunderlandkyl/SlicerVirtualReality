@@ -94,6 +94,7 @@
 #if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
 // VTK Rendering/OpenXR includes
 #include <vtkOpenXRCamera.h>
+#include <vtkOpenXRManager.h>
 #include <vtkOpenXRModel.h>
 #include <vtkOpenXRRenderWindow.h>
 #include <vtkOpenXRRenderer.h>
@@ -101,7 +102,6 @@
 
 #if defined(SlicerVirtualReality_HAS_OPENXRREMOTING_SUPPORT)
 // VTK Rendering/OpenXRRemoting includes
-#include <vtkOpenXRManager.h>
 #include <vtkOpenXRRemotingRenderWindow.h>
 #endif
 
@@ -272,6 +272,16 @@ void qMRMLVirtualRealityViewPrivate::createRenderWindow(vtkMRMLVirtualRealityVie
     this->InteractorStyle = interactorStyle;
     this->Interactor = vtkSmartPointer<vtkVirtualRealityViewOpenXRInteractor>::New();
     this->Camera = vtkSmartPointer<vtkOpenXRCamera>::New();
+
+    // Configure passthrough before Initialize() is called
+    if (this->MRMLVirtualRealityViewNode->GetPassthrough())
+    {
+      vtkOpenXRRenderWindow* xrRenderWindow = vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow);
+      if (xrRenderWindow)
+      {
+        xrRenderWindow->SetUsePassthrough(true);
+      }
+    }
   }
   else
 #endif
@@ -413,6 +423,44 @@ void qMRMLVirtualRealityViewPrivate::createRenderWindow(vtkMRMLVirtualRealityVie
     return;
   }
 
+  // If passthrough was requested, report the outcome.
+  // XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND is active immediately after Initialize();
+  // XR_FB_passthrough objects are created during Initialize() but xrPassthroughStartFB()
+  // is deferred to BeginSession() (first render tick), so IsFBPassthroughActive() is
+  // still false here — use IsFBPassthroughSupported() to report that it is pending.
+  // If neither mechanism is available, warn the user.
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+  if (this->MRMLVirtualRealityViewNode->GetPassthrough())
+  {
+    vtkOpenXRRenderWindow* xrRenderWindow = vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow);
+    if (xrRenderWindow)
+    {
+      if (xrRenderWindow->IsPassthroughActive())
+      {
+        // XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND is active right now.
+        qDebug() << "SlicerVirtualReality: Passthrough active (ALPHA_BLEND blend mode).";
+      }
+      else if (vtkOpenXRManager::GetInstance().IsFBPassthroughSupported())
+      {
+        // XR_FB_passthrough extension found and objects created; passthrough will
+        // activate on the first render tick when BeginSession() is called.
+        qDebug() << "SlicerVirtualReality: XR_FB_passthrough objects created; "
+                    "passthrough will activate when the XR session starts.";
+      }
+      else
+      {
+        qWarning() << "SlicerVirtualReality: Passthrough requested but no passthrough "
+                      "mechanism is available (neither XR_FB_passthrough nor "
+                      "XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND is supported by the runtime). "
+                      "VR rendering continues with normal background. "
+                      "For Meta Quest 3 via Quest Link: enable developer mode on the headset "
+                      "and ensure 'Allow apps to access passthrough' is enabled in the "
+                      "Meta XR PC app (Settings > General).";
+      }
+    }
+  }
+#endif
+
   // Keep track of last valid parameters in the settings
   QSettings().setValue("VirtualReality/DefaultXRBackend", xrBackendAsStr);
 #if defined(SlicerVirtualReality_HAS_OPENXRREMOTING_SUPPORT)
@@ -502,6 +550,19 @@ std::string qMRMLVirtualRealityViewPrivate::currentXRBackendRemotingIPAddress() 
 }
 
 // --------------------------------------------------------------------------
+bool qMRMLVirtualRealityViewPrivate::currentXRBackendPassthroughEnabled() const
+{
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+  vtkOpenXRRenderWindow* xrRenderWindow = vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow);
+  if (xrRenderWindow != nullptr)
+  {
+    return xrRenderWindow->GetUsePassthrough();
+  }
+#endif
+  return false;
+}
+
+// --------------------------------------------------------------------------
 void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRML()
 {
   if (this->IsUpdatingWidgetFromMRML)
@@ -532,7 +593,8 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
   // Reset initialization attempts and clear errors if the XR backend has changed
   if (this->currentXRBackend() != this->MRMLVirtualRealityViewNode->GetXRBackend()
       || this->currentXRBackendRemotingEnabled() != this->MRMLVirtualRealityViewNode->GetRemoting()
-      || this->currentXRBackendRemotingIPAddress() != this->MRMLVirtualRealityViewNode->GetPlayerIPAddress())
+      || this->currentXRBackendRemotingIPAddress() != this->MRMLVirtualRealityViewNode->GetPlayerIPAddress()
+      || this->currentXRBackendPassthroughEnabled() != this->MRMLVirtualRealityViewNode->GetPassthrough())
   {
     this->InitializationAttempts = 0;
     this->MRMLVirtualRealityViewNode->ClearError();
@@ -543,6 +605,7 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
   if ((this->currentXRBackend() != this->MRMLVirtualRealityViewNode->GetXRBackend()
        || this->currentXRBackendRemotingEnabled() != this->MRMLVirtualRealityViewNode->GetRemoting()
        || this->currentXRBackendRemotingIPAddress() != this->MRMLVirtualRealityViewNode->GetPlayerIPAddress()
+       || this->currentXRBackendPassthroughEnabled() != this->MRMLVirtualRealityViewNode->GetPassthrough()
        || this->currentXRBackend() == vtkMRMLVirtualRealityViewNode::UndefinedXRBackend)
       && this->MRMLVirtualRealityViewNode->GetVisibility())
   {
@@ -581,8 +644,29 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
   }
 
   // Renderer properties
-  if (this->MRMLVirtualRealityViewNode->GetRemoting())
+  // Use a transparent background only when the runtime has actually granted
+  // XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND (passthrough/AR mode).  If passthrough
+  // was requested but the runtime fell back to OPAQUE, use the normal gradient
+  // background so the user doesn't see an unwanted black screen.
+  // For XR_FB_passthrough, IsPassthroughActive() returns false until BeginSession()
+  // runs on the first render tick, so also check IsFBPassthroughSupported() — if
+  // handles were successfully created, passthrough will be active imminently and
+  // we should set the transparent background now.
+  bool passthroughActive = false;
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+  if (this->MRMLVirtualRealityViewNode->GetPassthrough())
   {
+    vtkOpenXRRenderWindow* xrRenderWindow = vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow);
+    passthroughActive = xrRenderWindow && xrRenderWindow->GetVRInitialized() &&
+      (xrRenderWindow->IsPassthroughActive() ||
+       vtkOpenXRManager::GetInstance().IsFBPassthroughSupported());
+  }
+#endif
+
+  if (this->MRMLVirtualRealityViewNode->GetRemoting() || passthroughActive)
+  {
+    // Use a transparent background so the real-world passthrough (or remoting
+    // AR background) shows through wherever no 3D content is rendered.
     this->Renderer->SetGradientBackground(0);
     this->Renderer->SetBackground(0.0, 0.0, 0.0);
     this->Renderer->SetBackgroundAlpha(0.0);

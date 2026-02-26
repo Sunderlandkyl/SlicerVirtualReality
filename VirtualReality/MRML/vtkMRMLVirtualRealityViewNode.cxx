@@ -87,6 +87,7 @@ void vtkMRMLVirtualRealityViewNode::WriteXML(ostream& of, int nIndent)
   // OpenXRRemoting
   vtkMRMLWriteXMLBooleanMacro(remoting, Remoting);
   vtkMRMLWriteXMLStdStringMacro(playerIPAddress, PlayerIPAddress);
+  vtkMRMLWriteXMLBooleanMacro(passthrough, Passthrough);
   vtkMRMLWriteXMLEndMacro();
 }
 
@@ -112,6 +113,7 @@ void vtkMRMLVirtualRealityViewNode::ReadXMLAttributes(const char** atts)
   // OpenXRRemoting
   vtkMRMLReadXMLBooleanMacro(remoting, Remoting);
   vtkMRMLReadXMLStdStringMacro(playerIPAddress, PlayerIPAddress);
+  vtkMRMLReadXMLBooleanMacro(passthrough, Passthrough);
   vtkMRMLReadXMLEndMacro();
 
   this->EndModify(disabledModify);
@@ -141,6 +143,7 @@ void vtkMRMLVirtualRealityViewNode::Copy(vtkMRMLNode* anode)
   // OpenXRRemoting
   vtkMRMLCopyBooleanMacro(Remoting);
   vtkMRMLCopyStringMacro(PlayerIPAddress);
+  vtkMRMLCopyBooleanMacro(Passthrough);
   vtkMRMLCopyEndMacro();
 
   this->EndModify(disabledModify);
@@ -166,6 +169,7 @@ void vtkMRMLVirtualRealityViewNode::PrintSelf(ostream& os, vtkIndent indent)
   // OpenXRRemoting
   vtkMRMLPrintBooleanMacro(Remoting);
   vtkMRMLPrintStdStringMacro(PlayerIPAddress);
+  vtkMRMLPrintBooleanMacro(Passthrough);
   vtkMRMLPrintEndMacro();
 }
 

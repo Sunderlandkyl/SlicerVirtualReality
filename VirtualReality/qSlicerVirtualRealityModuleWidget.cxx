@@ -95,6 +95,7 @@ void qSlicerVirtualRealityModuleWidget::setup()
   connect(d->XRBackendComboBox, SIGNAL(currentIndexChanged(int)), this, SLOT(setVirtualRealityXRBackend(int)));
   connect(d->RemotingEnabledCheckBox, SIGNAL(toggled(bool)), this, SLOT(setRemotingEnabled(bool)));
   connect(d->PlayerIPAddressLineEdit, SIGNAL(editingFinished()), this, SLOT(onPlayerIPAddressLineEditEditingFinished()));
+  connect(d->PassthroughEnabledCheckBox, SIGNAL(toggled(bool)), this, SLOT(setPassthroughEnabled(bool)));
 
   connect(d->ConnectCheckBox, SIGNAL(toggled(bool)), this, SLOT(setVirtualRealityConnected(bool)));
   connect(d->RenderingEnabledCheckBox, SIGNAL(toggled(bool)), this, SLOT(setVirtualRealityActive(bool)));
@@ -241,6 +242,15 @@ void qSlicerVirtualRealityModuleWidget::updateWidgetFromMRML()
         && vrViewNode->GetRemoting());
   d->PlayerIPAddressLineEdit->setReadOnly(vrLogic->GetVirtualRealityConnected());
   d->PlayerIPAddressLineEdit->blockSignals(wasBlocked);
+
+  // Passthrough
+  wasBlocked = d->PassthroughEnabledCheckBox->blockSignals(true);
+  d->PassthroughEnabledCheckBox->setChecked(vrViewNode != nullptr ? vrViewNode->GetPassthrough() : false);
+  d->PassthroughEnabledCheckBox->setEnabled(
+        (vrViewNode != nullptr)
+        && vrViewNode->GetXRBackend() == vtkMRMLVirtualRealityViewNode::OpenXR
+        && !vrLogic->GetVirtualRealityConnected());
+  d->PassthroughEnabledCheckBox->blockSignals(wasBlocked);
 }
 
 
@@ -475,6 +485,17 @@ void qSlicerVirtualRealityModuleWidget::setRemotingEnabled(bool enabled)
   if (vrViewNode)
   {
     vrViewNode->SetRemoting(enabled);
+  }
+}
+
+//----------------------------------------------------------------------------
+void qSlicerVirtualRealityModuleWidget::setPassthroughEnabled(bool enabled)
+{
+  vtkSlicerVirtualRealityLogic* vrLogic = vtkSlicerVirtualRealityLogic::SafeDownCast(this->logic());
+  vtkMRMLVirtualRealityViewNode* vrViewNode = vrLogic->GetVirtualRealityViewNode();
+  if (vrViewNode)
+  {
+    vrViewNode->SetPassthrough(enabled);
   }
 }
 

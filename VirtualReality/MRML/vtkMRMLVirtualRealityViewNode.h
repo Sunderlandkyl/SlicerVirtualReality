@@ -255,6 +255,24 @@ public:
   vtkGetMacro(PlayerIPAddress, std::string);
   ///@}
 
+  ///@{
+  /// Enable camera passthrough (mixed reality / AR mode) for OpenXR.
+  ///
+  /// When enabled, the real-world view seen through the headset cameras is
+  /// blended with the rendered 3D scene using
+  /// XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND.  The scene background is rendered
+  /// fully transparent so the camera feed shows through.
+  ///
+  /// This option only has an effect when the XR backend is OpenXR and the
+  /// runtime supports XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND (e.g. Meta Quest 3
+  /// via Quest Link / Air Link).
+  ///
+  /// Changing this setting requires reconnecting to the headset.
+  vtkGetMacro(Passthrough, bool);
+  vtkSetMacro(Passthrough, bool);
+  vtkBooleanMacro(Passthrough, bool);
+  ///@}
+
   /// Return true if an error has occurred.
   /// "Connected" member requests connection but this method can tell if the
   /// hardware connection has been actually successfully established.
@@ -289,6 +307,9 @@ protected:
   // OpenXRRemoting
   bool Remoting{false};
   std::string PlayerIPAddress;
+
+  // Passthrough (OpenXR alpha blend mode)
+  bool Passthrough{false};
 
   vtkMRMLVirtualRealityViewNode();
   ~vtkMRMLVirtualRealityViewNode() override;

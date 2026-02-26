@@ -78,6 +78,11 @@ public:
   void OnRotate() override { this->InteractorStyleDelegate->OnRotate(); }
   //@}
 
+  /**
+   * Setup default actions defined with an action path and a corresponding command.
+   */
+  void SetupActions(vtkRenderWindowInteractor* iren) override;
+
   //@{
   /**
   * Methods for interaction.
