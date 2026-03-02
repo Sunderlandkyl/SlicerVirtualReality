@@ -59,6 +59,9 @@ public slots:
   void onPlayerIPAddressLineEditEditingFinished();
   // Passthrough
   void setPassthroughEnabled(bool);
+  // Environment-depth occlusion
+  void onOccludedOpacityChanged(double);
+  void setEnvDepthDebugVisualization(bool);
 
 protected slots:
   void updateWidgetFromMRML();

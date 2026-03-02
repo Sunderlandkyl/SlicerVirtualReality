@@ -96,6 +96,8 @@ void qSlicerVirtualRealityModuleWidget::setup()
   connect(d->RemotingEnabledCheckBox, SIGNAL(toggled(bool)), this, SLOT(setRemotingEnabled(bool)));
   connect(d->PlayerIPAddressLineEdit, SIGNAL(editingFinished()), this, SLOT(onPlayerIPAddressLineEditEditingFinished()));
   connect(d->PassthroughEnabledCheckBox, SIGNAL(toggled(bool)), this, SLOT(setPassthroughEnabled(bool)));
+  connect(d->OccludedOpacitySlider, SIGNAL(valueChanged(double)), this, SLOT(onOccludedOpacityChanged(double)));
+  connect(d->EnvDepthDebugCheckBox, SIGNAL(toggled(bool)), this, SLOT(setEnvDepthDebugVisualization(bool)));
 
   connect(d->ConnectCheckBox, SIGNAL(toggled(bool)), this, SLOT(setVirtualRealityConnected(bool)));
   connect(d->RenderingEnabledCheckBox, SIGNAL(toggled(bool)), this, SLOT(setVirtualRealityActive(bool)));
@@ -251,6 +253,19 @@ void qSlicerVirtualRealityModuleWidget::updateWidgetFromMRML()
         && vrViewNode->GetXRBackend() == vtkMRMLVirtualRealityViewNode::OpenXR
         && !vrLogic->GetVirtualRealityConnected());
   d->PassthroughEnabledCheckBox->blockSignals(wasBlocked);
+
+  // Environment-depth occlusion
+  wasBlocked = d->OccludedOpacitySlider->blockSignals(true);
+  d->OccludedOpacitySlider->setValue(vrViewNode != nullptr ? vrViewNode->GetOccludedOpacity() : 0.0);
+  d->OccludedOpacitySlider->setEnabled(vrViewNode != nullptr
+        && vrViewNode->GetXRBackend() == vtkMRMLVirtualRealityViewNode::OpenXR);
+  d->OccludedOpacitySlider->blockSignals(wasBlocked);
+
+  wasBlocked = d->EnvDepthDebugCheckBox->blockSignals(true);
+  d->EnvDepthDebugCheckBox->setChecked(vrViewNode != nullptr ? vrViewNode->GetEnvDepthDebugVisualization() : false);
+  d->EnvDepthDebugCheckBox->setEnabled(vrViewNode != nullptr
+        && vrViewNode->GetXRBackend() == vtkMRMLVirtualRealityViewNode::OpenXR);
+  d->EnvDepthDebugCheckBox->blockSignals(wasBlocked);
 }
 
 
@@ -496,6 +511,28 @@ void qSlicerVirtualRealityModuleWidget::setPassthroughEnabled(bool enabled)
   if (vrViewNode)
   {
     vrViewNode->SetPassthrough(enabled);
+  }
+}
+
+//----------------------------------------------------------------------------
+void qSlicerVirtualRealityModuleWidget::onOccludedOpacityChanged(double value)
+{
+  vtkSlicerVirtualRealityLogic* vrLogic = vtkSlicerVirtualRealityLogic::SafeDownCast(this->logic());
+  vtkMRMLVirtualRealityViewNode* vrViewNode = vrLogic->GetVirtualRealityViewNode();
+  if (vrViewNode)
+  {
+    vrViewNode->SetOccludedOpacity(value);
+  }
+}
+
+//----------------------------------------------------------------------------
+void qSlicerVirtualRealityModuleWidget::setEnvDepthDebugVisualization(bool enabled)
+{
+  vtkSlicerVirtualRealityLogic* vrLogic = vtkSlicerVirtualRealityLogic::SafeDownCast(this->logic());
+  vtkMRMLVirtualRealityViewNode* vrViewNode = vrLogic->GetVirtualRealityViewNode();
+  if (vrViewNode)
+  {
+    vrViewNode->SetEnvDepthDebugVisualization(enabled);
   }
 }
 

@@ -273,13 +273,20 @@ void qMRMLVirtualRealityViewPrivate::createRenderWindow(vtkMRMLVirtualRealityVie
     this->Interactor = vtkSmartPointer<vtkVirtualRealityViewOpenXRInteractor>::New();
     this->Camera = vtkSmartPointer<vtkOpenXRCamera>::New();
 
-    // Configure passthrough before Initialize() is called
-    if (this->MRMLVirtualRealityViewNode->GetPassthrough())
+    // Configure passthrough and occlusion before Initialize() is called.
+    // SelectExtensions() (called during Initialize) checks these values to decide
+    // which XR extensions to load; they cannot be changed without a reconnect.
     {
       vtkOpenXRRenderWindow* xrRenderWindow = vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow);
       if (xrRenderWindow)
       {
-        xrRenderWindow->SetUsePassthrough(true);
+        if (this->MRMLVirtualRealityViewNode->GetPassthrough())
+        {
+          xrRenderWindow->SetUsePassthrough(true);
+        }
+        // OccludedOpacity < 1.0 requires XR_META_environment_depth to be loaded at Init time.
+        xrRenderWindow->SetOccludedOpacity(
+          static_cast<float>(this->MRMLVirtualRealityViewNode->GetOccludedOpacity()));
       }
     }
   }
@@ -742,6 +749,19 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
           }
           model->SetVisibility(this->MRMLVirtualRealityViewNode->GetLighthouseModelsVisible());
         }
+      }
+    }
+#endif
+
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+    {
+      vtkOpenXRRenderWindow* xrRenderWindow = vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow);
+      if (xrRenderWindow)
+      {
+        xrRenderWindow->SetOccludedOpacity(
+          static_cast<float>(this->MRMLVirtualRealityViewNode->GetOccludedOpacity()));
+        xrRenderWindow->SetShowEnvDepthDebugVisualization(
+          this->MRMLVirtualRealityViewNode->GetEnvDepthDebugVisualization());
       }
     }
 #endif

@@ -273,6 +273,28 @@ public:
   vtkBooleanMacro(Passthrough, bool);
   ///@}
 
+  ///@{
+  /// Opacity applied to virtual geometry that is occluded by real-world
+  /// surfaces when XR_META_environment_depth occlusion is active.
+  ///
+  ///  0.0 (default) – fully occluded (hard depth pre-pass).
+  ///  0.0 < x < 1.0 – partial occlusion (post-pass alpha blend).
+  ///  1.0            – no depth composition (bypass entirely).
+  ///
+  /// Has no effect when env-depth is unavailable or inactive.
+  vtkGetMacro(OccludedOpacity, double);
+  vtkSetClampMacro(OccludedOpacity, double, 0.0, 1.0);
+  ///@}
+
+  ///@{
+  /// Show a false-colour overlay of the real-world depth texture for debugging.
+  /// Red = near (0 m), blue = far (~5 m).
+  /// Has no effect when XR_META_environment_depth is unavailable or inactive.
+  vtkGetMacro(EnvDepthDebugVisualization, bool);
+  vtkSetMacro(EnvDepthDebugVisualization, bool);
+  vtkBooleanMacro(EnvDepthDebugVisualization, bool);
+  ///@}
+
   /// Return true if an error has occurred.
   /// "Connected" member requests connection but this method can tell if the
   /// hardware connection has been actually successfully established.
@@ -310,6 +332,10 @@ protected:
 
   // Passthrough (OpenXR alpha blend mode)
   bool Passthrough{false};
+
+  // Environment-depth occlusion (XR_META_environment_depth)
+  double OccludedOpacity{1.0};
+  bool EnvDepthDebugVisualization{false};
 
   vtkMRMLVirtualRealityViewNode();
   ~vtkMRMLVirtualRealityViewNode() override;
