@@ -295,6 +295,33 @@ public:
   vtkBooleanMacro(EnvDepthDebugVisualization, bool);
   ///@}
 
+  ///@{
+  /// If enabled, the rendered left-eye VR scene is captured each render tick
+  /// and written to a vtkMRMLVectorVolumeNode named "VR Scene (Left Eye)"
+  /// (RGB, unsigned char).
+  ///
+  /// The captured image is the rendered VR scene for the left eye as submitted
+  /// to the display. This is not the raw headset camera feed; it is the
+  /// composited output of the VR renderer (geometry, overlays, etc.).
+  /// When XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND (passthrough) is active,
+  /// transparent areas will include the real-world camera feed composited by
+  /// the runtime, but the primary content is the rendered scene.
+  vtkGetMacro(VRSceneColorVolumeEnabled, bool);
+  vtkSetMacro(VRSceneColorVolumeEnabled, bool);
+  vtkBooleanMacro(VRSceneColorVolumeEnabled, bool);
+  ///@}
+
+  ///@{
+  /// If enabled, the real-world environment depth is captured each render tick
+  /// (via XR_META_environment_depth) and written to a vtkMRMLScalarVolumeNode
+  /// named "Passthrough Depth".  Scalar values are in millimetres (float).
+  ///
+  /// Has no effect if XR_META_environment_depth is unavailable or inactive.
+  vtkGetMacro(PassthroughDepthVolumeEnabled, bool);
+  vtkSetMacro(PassthroughDepthVolumeEnabled, bool);
+  vtkBooleanMacro(PassthroughDepthVolumeEnabled, bool);
+  ///@}
+
   /// Return true if an error has occurred.
   /// "Connected" member requests connection but this method can tell if the
   /// hardware connection has been actually successfully established.
@@ -336,6 +363,10 @@ protected:
   // Environment-depth occlusion (XR_META_environment_depth)
   double OccludedOpacity{1.0};
   bool EnvDepthDebugVisualization{false};
+
+  // VR scene / passthrough volume capture
+  bool VRSceneColorVolumeEnabled{false};
+  bool PassthroughDepthVolumeEnabled{false};
 
   vtkMRMLVirtualRealityViewNode();
   ~vtkMRMLVirtualRealityViewNode() override;

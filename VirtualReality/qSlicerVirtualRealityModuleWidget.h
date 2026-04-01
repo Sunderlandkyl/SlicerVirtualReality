@@ -59,6 +59,8 @@ public slots:
   void onPlayerIPAddressLineEditEditingFinished();
   // Passthrough
   void setPassthroughEnabled(bool);
+  void setVRSceneColorVolumeEnabled(bool);
+  void setPassthroughDepthVolumeEnabled(bool);
   // Environment-depth occlusion
   void onOccludedOpacityChanged(double);
   void setEnvDepthDebugVisualization(bool);

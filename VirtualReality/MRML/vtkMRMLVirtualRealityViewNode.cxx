@@ -90,6 +90,8 @@ void vtkMRMLVirtualRealityViewNode::WriteXML(ostream& of, int nIndent)
   vtkMRMLWriteXMLBooleanMacro(passthrough, Passthrough);
   vtkMRMLWriteXMLFloatMacro(occludedOpacity, OccludedOpacity);
   vtkMRMLWriteXMLBooleanMacro(envDepthDebugVisualization, EnvDepthDebugVisualization);
+  vtkMRMLWriteXMLBooleanMacro(vrSceneColorVolumeEnabled, VRSceneColorVolumeEnabled);
+  vtkMRMLWriteXMLBooleanMacro(passthroughDepthVolumeEnabled, PassthroughDepthVolumeEnabled);
   vtkMRMLWriteXMLEndMacro();
 }
 
@@ -118,6 +120,8 @@ void vtkMRMLVirtualRealityViewNode::ReadXMLAttributes(const char** atts)
   vtkMRMLReadXMLBooleanMacro(passthrough, Passthrough);
   vtkMRMLReadXMLFloatMacro(occludedOpacity, OccludedOpacity);
   vtkMRMLReadXMLBooleanMacro(envDepthDebugVisualization, EnvDepthDebugVisualization);
+  vtkMRMLReadXMLBooleanMacro(vrSceneColorVolumeEnabled, VRSceneColorVolumeEnabled);
+  vtkMRMLReadXMLBooleanMacro(passthroughDepthVolumeEnabled, PassthroughDepthVolumeEnabled);
   vtkMRMLReadXMLEndMacro();
 
   this->EndModify(disabledModify);
@@ -150,6 +154,8 @@ void vtkMRMLVirtualRealityViewNode::Copy(vtkMRMLNode* anode)
   vtkMRMLCopyBooleanMacro(Passthrough);
   vtkMRMLCopyFloatMacro(OccludedOpacity);
   vtkMRMLCopyBooleanMacro(EnvDepthDebugVisualization);
+  vtkMRMLCopyBooleanMacro(VRSceneColorVolumeEnabled);
+  vtkMRMLCopyBooleanMacro(PassthroughDepthVolumeEnabled);
   vtkMRMLCopyEndMacro();
 
   this->EndModify(disabledModify);
@@ -178,6 +184,8 @@ void vtkMRMLVirtualRealityViewNode::PrintSelf(ostream& os, vtkIndent indent)
   vtkMRMLPrintBooleanMacro(Passthrough);
   vtkMRMLPrintFloatMacro(OccludedOpacity);
   vtkMRMLPrintBooleanMacro(EnvDepthDebugVisualization);
+  vtkMRMLPrintBooleanMacro(VRSceneColorVolumeEnabled);
+  vtkMRMLPrintBooleanMacro(PassthroughDepthVolumeEnabled);
   vtkMRMLPrintEndMacro();
 }
 

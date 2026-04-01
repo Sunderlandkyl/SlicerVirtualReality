@@ -78,7 +78,9 @@
 // MRML includes
 #include <vtkMRMLCameraNode.h>
 #include <vtkMRMLLinearTransformNode.h>
+#include <vtkMRMLScalarVolumeNode.h>
 #include <vtkMRMLScene.h>
+#include <vtkMRMLVectorVolumeNode.h>
 
 #if defined(SlicerVirtualReality_HAS_OPENVR_SUPPORT)
 // VTK Rendering/OpenVR includes
@@ -111,9 +113,13 @@
 #include <vtkVRRenderWindow.h>
 #include <vtkVRRenderWindowInteractor.h>
 
+// VTK OpenGL loader (provides raw OpenGL 4.x function pointers)
+#include <vtk_glad.h>
+
 // VTK includes
 #include <vtkCollection.h>
 #include <vtkCullerCollection.h>
+#include <vtkImageData.h>
 #include <vtkLight.h>
 #include <vtkLightCollection.h>
 #include <vtkNew.h>
@@ -133,17 +139,17 @@ namespace
   {
     switch (result)
     {
-      case vr::TrackingResult_Calibrating_InProgress:
-        return "CalibratingInProgress";
-      case vr::TrackingResult_Calibrating_OutOfRange:
-        return "CalibratingOutOfRange";
-      case vr::TrackingResult_Running_OK:
-        return "RunningOk";
-      case vr::TrackingResult_Running_OutOfRange:
-        return "RunningOutOfRange";
-      case vr::TrackingResult_Uninitialized:
-      default:
-        return "Uninitialized";
+    case vr::TrackingResult_Calibrating_InProgress:
+      return "CalibratingInProgress";
+    case vr::TrackingResult_Calibrating_OutOfRange:
+      return "CalibratingOutOfRange";
+    case vr::TrackingResult_Running_OK:
+      return "RunningOk";
+    case vr::TrackingResult_Running_OutOfRange:
+      return "RunningOutOfRange";
+    case vr::TrackingResult_Uninitialized:
+    default:
+      return "Uninitialized";
     }
   }
 #endif
@@ -249,55 +255,59 @@ void qMRMLVirtualRealityViewPrivate::createRenderWindow(vtkMRMLVirtualRealityVie
   else
 #endif
 #if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
-  if (xrBackend == vtkMRMLVirtualRealityViewNode::OpenXR)
-  {
-    vtkNew<vtkVirtualRealityViewOpenXRInteractorStyle> interactorStyle;
-    interactorStyle->SetInteractorStyleDelegate(this->InteractorStyleDelegate);
+    if (xrBackend == vtkMRMLVirtualRealityViewNode::OpenXR)
+    {
+      vtkNew<vtkVirtualRealityViewOpenXRInteractorStyle> interactorStyle;
+      interactorStyle->SetInteractorStyleDelegate(this->InteractorStyleDelegate);
 
 #if defined(SlicerVirtualReality_HAS_OPENXRREMOTING_SUPPORT)
-    if (this->MRMLVirtualRealityViewNode->GetRemoting())
-    {
-      vtkSmartPointer<vtkOpenXRRemotingRenderWindow> xrRemotingRenderWindow = vtkSmartPointer<vtkOpenXRRemotingRenderWindow>::New();
-      xrRemotingRenderWindow->SetRemotingIPAddress(this->MRMLVirtualRealityViewNode->GetPlayerIPAddress().c_str());
-      // Address "wglDXRegisterObjectNV failed in RegisterSharedTexture()" reported when using "OpenXRRemoting"
-      xrRemotingRenderWindow->GetHelperWindow()->SetMultiSamples(0);
-      this->RenderWindow = xrRemotingRenderWindow;
+      if (this->MRMLVirtualRealityViewNode->GetRemoting())
+      {
+        vtkSmartPointer<vtkOpenXRRemotingRenderWindow> xrRemotingRenderWindow = vtkSmartPointer<vtkOpenXRRemotingRenderWindow>::New();
+        xrRemotingRenderWindow->SetRemotingIPAddress(this->MRMLVirtualRealityViewNode->GetPlayerIPAddress().c_str());
+        // Address "wglDXRegisterObjectNV failed in RegisterSharedTexture()" reported when using "OpenXRRemoting"
+        xrRemotingRenderWindow->GetHelperWindow()->SetMultiSamples(0);
+        this->RenderWindow = xrRemotingRenderWindow;
+      }
+      else
+#endif
+      {
+        this->RenderWindow = vtkSmartPointer<vtkOpenXRRenderWindow>::New();
+      }
+      this->Renderer = vtkSmartPointer<vtkOpenXRRenderer>::New();
+      this->InteractorStyle = interactorStyle;
+      this->Interactor = vtkSmartPointer<vtkVirtualRealityViewOpenXRInteractor>::New();
+      this->Camera = vtkSmartPointer<vtkOpenXRCamera>::New();
+
+      // Configure passthrough and occlusion before Initialize() is called.
+      // SelectExtensions() (called during Initialize) checks these values to decide
+      // which XR extensions to load; they cannot be changed without a reconnect.
+      {
+        vtkOpenXRRenderWindow* xrRenderWindow = vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow);
+        if (xrRenderWindow)
+        {
+          if (this->MRMLVirtualRealityViewNode->GetPassthrough())
+          {
+            xrRenderWindow->SetUsePassthrough(true);
+          }
+          // OccludedOpacity < 1.0 requires XR_META_environment_depth to be loaded at Init time.
+          xrRenderWindow->SetOccludedOpacity(
+            0.0);
+          // Also request env depth when depth volume capture is enabled, even if
+          // depth occlusion is not active (OccludedOpacity == 1.0).
+          xrRenderWindow->SetCaptureEnvironmentDepth(
+            this->MRMLVirtualRealityViewNode->GetPassthroughDepthVolumeEnabled());
+        }
+      }
     }
     else
 #endif
     {
-      this->RenderWindow = vtkSmartPointer<vtkOpenXRRenderWindow>::New();
+      this->destroyRenderWindow();
+      qWarning() << "No XR backend initialized";
+      this->MRMLVirtualRealityViewNode->SetError("Connection failed: No XR backend initialized");
+      return;
     }
-    this->Renderer = vtkSmartPointer<vtkOpenXRRenderer>::New();
-    this->InteractorStyle = interactorStyle;
-    this->Interactor = vtkSmartPointer<vtkVirtualRealityViewOpenXRInteractor>::New();
-    this->Camera = vtkSmartPointer<vtkOpenXRCamera>::New();
-
-    // Configure passthrough and occlusion before Initialize() is called.
-    // SelectExtensions() (called during Initialize) checks these values to decide
-    // which XR extensions to load; they cannot be changed without a reconnect.
-    {
-      vtkOpenXRRenderWindow* xrRenderWindow = vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow);
-      if (xrRenderWindow)
-      {
-        if (this->MRMLVirtualRealityViewNode->GetPassthrough())
-        {
-          xrRenderWindow->SetUsePassthrough(true);
-        }
-        // OccludedOpacity < 1.0 requires XR_META_environment_depth to be loaded at Init time.
-        xrRenderWindow->SetOccludedOpacity(
-          static_cast<float>(this->MRMLVirtualRealityViewNode->GetOccludedOpacity()));
-      }
-    }
-  }
-  else
-#endif
-  {
-    this->destroyRenderWindow();
-    qWarning() << "No XR backend initialized";
-    this->MRMLVirtualRealityViewNode->SetError("Connection failed: No XR backend initialized");
-    return;
-  }
 
   // InteractorStyle
   this->InteractorStyle->SetCurrentRenderer(this->Renderer);
@@ -326,10 +336,15 @@ void qMRMLVirtualRealityViewPrivate::createRenderWindow(vtkMRMLVirtualRealityVie
 
   // Observe VR render window event
   qvtkReconnect(this->RenderWindow, vtkVRRenderWindow::PhysicalToWorldMatrixModified,
-                q, SLOT(onPhysicalToWorldMatrixModified()));
+    q, SLOT(onPhysicalToWorldMatrixModified()));
+
+  // Observe renderer EndEvent to capture passthrough volume data while the
+  // rendering FBO is still valid (before swapchain release).
+  qvtkReconnect(this->Renderer, vtkCommand::EndEvent,
+    this, SLOT(onRendererEndEvent()));
 
   // Observe button press event
-  qvtkReconnect(this->Interactor, vtkCommand::Button3DEvent, q, SLOT(onButton3DEvent(vtkObject*,void*,unsigned long,void*)));
+  qvtkReconnect(this->Interactor, vtkCommand::Button3DEvent, q, SLOT(onButton3DEvent(vtkObject*, void*, unsigned long, void*)));
 
   //
   // DisplayableManager registration
@@ -340,26 +355,26 @@ void qMRMLVirtualRealityViewPrivate::createRenderWindow(vtkMRMLVirtualRealityVie
 
   QStringList displayableManagers;
   displayableManagers
-      // Slicer
-      //<< "vtkMRMLCameraDisplayableManager" // Not supported in VR, vtkVRCamera has no MRML node counterpart
-      //<< "vtkMRMLViewDisplayableManager" // Not supported in VR, require a vtkMRMLCameraNode
-      << "vtkMRMLModelDisplayableManager"
-      << "vtkMRMLThreeDReformatDisplayableManager"
-      << "vtkMRMLCrosshairDisplayableManager3D"
-      //<< "vtkMRMLOrientationMarkerDisplayableManager" // Not supported in VR
-      //<< "vtkMRMLRulerDisplayableManager" // Not supported in VR
-      //<< "vtkMRMLAnnotationDisplayableManager" // Not supported in VR
-      << "vtkMRMLMarkupsDisplayableManager"
-      << "vtkMRMLSegmentationsDisplayableManager3D"
-      << "vtkMRMLTransformsDisplayableManager3D"
+    // Slicer
+    //<< "vtkMRMLCameraDisplayableManager" // Not supported in VR, vtkVRCamera has no MRML node counterpart
+    //<< "vtkMRMLViewDisplayableManager" // Not supported in VR, require a vtkMRMLCameraNode
+    << "vtkMRMLModelDisplayableManager"
+    << "vtkMRMLThreeDReformatDisplayableManager"
+    << "vtkMRMLCrosshairDisplayableManager3D"
+    //<< "vtkMRMLOrientationMarkerDisplayableManager" // Not supported in VR
+    //<< "vtkMRMLRulerDisplayableManager" // Not supported in VR
+    //<< "vtkMRMLAnnotationDisplayableManager" // Not supported in VR
+    << "vtkMRMLMarkupsDisplayableManager"
+    << "vtkMRMLSegmentationsDisplayableManager3D"
+    << "vtkMRMLTransformsDisplayableManager3D"
 #if ((Slicer_VERSION_MAJOR == 5 && Slicer_VERSION_MINOR >= 7) || (Slicer_VERSION_MAJOR > 5))
-      << "vtkMRMLLinearTransformsDisplayableManager"
+    << "vtkMRMLLinearTransformsDisplayableManager"
 #else
-      << "vtkMRMLLinearTransformsDisplayableManager3D"
+    << "vtkMRMLLinearTransformsDisplayableManager3D"
 #endif
-      << "vtkMRMLVolumeRenderingDisplayableManager"
-      ;
-  foreach (const QString& displayableManager, displayableManagers)
+    << "vtkMRMLVolumeRenderingDisplayableManager"
+    ;
+  foreach(const QString & displayableManager, displayableManagers)
   {
     if (!factory->IsDisplayableManagerRegistered(displayableManager.toLatin1()))
     {
@@ -368,14 +383,14 @@ void qMRMLVirtualRealityViewPrivate::createRenderWindow(vtkMRMLVirtualRealityVie
   }
 
   this->DisplayableManagerGroup = vtkSmartPointer<vtkMRMLDisplayableManagerGroup>::Take(
-                                    factory->InstantiateDisplayableManagers(q->renderer()));
+    factory->InstantiateDisplayableManagers(q->renderer()));
   this->DisplayableManagerGroup->SetMRMLDisplayableNode(this->MRMLVirtualRealityViewNode);
   this->InteractorStyleDelegate->SetDisplayableManagers(this->DisplayableManagerGroup);
   this->InteractorObserver->SetDisplayableManagers(this->DisplayableManagerGroup);
 
   // Default inputs mapping
   vtkSlicerVirtualRealityLogic::SetTriggerButtonFunction(
-        this->Interactor, vtkSlicerVirtualRealityLogic::GetButtonFunctionIdForGrabObjectsAndWorld());
+    this->Interactor, vtkSlicerVirtualRealityLogic::GetButtonFunctionIdForGrabObjectsAndWorld());
 
   ///CONFIGURATION OF THE OPENVR ENVIRONEMENT
 
@@ -452,17 +467,17 @@ void qMRMLVirtualRealityViewPrivate::createRenderWindow(vtkMRMLVirtualRealityVie
         // XR_FB_passthrough extension found and objects created; passthrough will
         // activate on the first render tick when BeginSession() is called.
         qDebug() << "SlicerVirtualReality: XR_FB_passthrough objects created; "
-                    "passthrough will activate when the XR session starts.";
+          "passthrough will activate when the XR session starts.";
       }
       else
       {
         qWarning() << "SlicerVirtualReality: Passthrough requested but no passthrough "
-                      "mechanism is available (neither XR_FB_passthrough nor "
-                      "XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND is supported by the runtime). "
-                      "VR rendering continues with normal background. "
-                      "For Meta Quest 3 via Quest Link: enable developer mode on the headset "
-                      "and ensure 'Allow apps to access passthrough' is enabled in the "
-                      "Meta XR PC app (Settings > General).";
+          "mechanism is available (neither XR_FB_passthrough nor "
+          "XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND is supported by the runtime). "
+          "VR rendering continues with normal background. "
+          "For Meta Quest 3 via Quest Link: enable developer mode on the headset "
+          "and ensure 'Allow apps to access passthrough' is enabled in the "
+          "Meta XR PC app (Settings > General).";
       }
     }
   }
@@ -481,7 +496,7 @@ void qMRMLVirtualRealityViewPrivate::createRenderWindow(vtkMRMLVirtualRealityVie
   qDebug() << "ActionManifestPath:" << q->actionManifestPath();
   qDebug() << "Number of registered displayable manager:" << this->DisplayableManagerGroup->GetDisplayableManagerCount();
   qDebug() << "Registered displayable managers:";
-  for (int idx=0; idx < this->DisplayableManagerGroup->GetDisplayableManagerCount(); idx++)
+  for (int idx = 0; idx < this->DisplayableManagerGroup->GetDisplayableManagerCount(); idx++)
   {
     qDebug() << " " << this->DisplayableManagerGroup->GetNthDisplayableManager(idx)->GetClassName();
   }
@@ -524,15 +539,15 @@ vtkMRMLVirtualRealityViewNode::XRBackendType qMRMLVirtualRealityViewPrivate::cur
 #if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
   if (vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow) != nullptr
 #if defined(SlicerVirtualReality_HAS_OPENXRREMOTING_SUPPORT)
-      || vtkOpenXRRemotingRenderWindow::SafeDownCast(this->RenderWindow) != nullptr
+    || vtkOpenXRRemotingRenderWindow::SafeDownCast(this->RenderWindow) != nullptr
 #endif
-      )
+    )
   {
     return vtkMRMLVirtualRealityViewNode::OpenXR;
   }
 #endif
   qCritical() << Q_FUNC_INFO << " failed: RenderWindow is not a supported type: "
-              << this->RenderWindow->GetClassName();
+    << this->RenderWindow->GetClassName();
   return vtkMRMLVirtualRealityViewNode::UndefinedXRBackend;
 }
 
@@ -573,10 +588,10 @@ bool qMRMLVirtualRealityViewPrivate::currentXRBackendPassthroughEnabled() const
 void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRML()
 {
   if (this->IsUpdatingWidgetFromMRML)
-    {
+  {
     // Updating widget from MRML is already in progress
     return;
-    }
+  }
   this->IsUpdatingWidgetFromMRML = true;
 
   this->updateWidgetFromMRMLNoModify();
@@ -599,9 +614,9 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
 
   // Reset initialization attempts and clear errors if the XR backend has changed
   if (this->currentXRBackend() != this->MRMLVirtualRealityViewNode->GetXRBackend()
-      || this->currentXRBackendRemotingEnabled() != this->MRMLVirtualRealityViewNode->GetRemoting()
-      || this->currentXRBackendRemotingIPAddress() != this->MRMLVirtualRealityViewNode->GetPlayerIPAddress()
-      || this->currentXRBackendPassthroughEnabled() != this->MRMLVirtualRealityViewNode->GetPassthrough())
+    || this->currentXRBackendRemotingEnabled() != this->MRMLVirtualRealityViewNode->GetRemoting()
+    || this->currentXRBackendRemotingIPAddress() != this->MRMLVirtualRealityViewNode->GetPlayerIPAddress()
+    || this->currentXRBackendPassthroughEnabled() != this->MRMLVirtualRealityViewNode->GetPassthrough())
   {
     this->InitializationAttempts = 0;
     this->MRMLVirtualRealityViewNode->ClearError();
@@ -610,11 +625,11 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
   // Attempt to initialize XR backend if the current backend differs or is undefined, and
   // the view is visible (i.e., connected to the hardware)
   if ((this->currentXRBackend() != this->MRMLVirtualRealityViewNode->GetXRBackend()
-       || this->currentXRBackendRemotingEnabled() != this->MRMLVirtualRealityViewNode->GetRemoting()
-       || this->currentXRBackendRemotingIPAddress() != this->MRMLVirtualRealityViewNode->GetPlayerIPAddress()
-       || this->currentXRBackendPassthroughEnabled() != this->MRMLVirtualRealityViewNode->GetPassthrough()
-       || this->currentXRBackend() == vtkMRMLVirtualRealityViewNode::UndefinedXRBackend)
-      && this->MRMLVirtualRealityViewNode->GetVisibility())
+    || this->currentXRBackendRemotingEnabled() != this->MRMLVirtualRealityViewNode->GetRemoting()
+    || this->currentXRBackendRemotingIPAddress() != this->MRMLVirtualRealityViewNode->GetPlayerIPAddress()
+    || this->currentXRBackendPassthroughEnabled() != this->MRMLVirtualRealityViewNode->GetPassthrough()
+    || this->currentXRBackend() == vtkMRMLVirtualRealityViewNode::UndefinedXRBackend)
+    && this->MRMLVirtualRealityViewNode->GetVisibility())
   {
     // Bail if there are no more attempts left
     constexpr int maximumNumberOfAttempts = 1;
@@ -630,8 +645,8 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
 
     // Log the initialization attempt
     qDebug().noquote().nospace()
-        << "Initializing \"" << xrBackendAsStr << "\" XR backend "
-        << QString("(%1/%2)").arg(this->InitializationAttempts).arg(maximumNumberOfAttempts);
+      << "Initializing \"" << xrBackendAsStr << "\" XR backend "
+      << QString("(%1/%2)").arg(this->InitializationAttempts).arg(maximumNumberOfAttempts);
 
     // Destroy and recreate the render window
     this->destroyRenderWindow();
@@ -640,7 +655,7 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
 
   // Skip further updates if the XR backend is undefined or if the view node has an error
   if (this->currentXRBackend() == vtkMRMLVirtualRealityViewNode::UndefinedXRBackend
-      || this->MRMLVirtualRealityViewNode->HasError())
+    || this->MRMLVirtualRealityViewNode->HasError())
   {
     return;
   }
@@ -666,7 +681,7 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
     vtkOpenXRRenderWindow* xrRenderWindow = vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow);
     passthroughActive = xrRenderWindow && xrRenderWindow->GetVRInitialized() &&
       (xrRenderWindow->IsPassthroughActive() ||
-       vtkOpenXRManager::GetInstance().IsFBPassthroughSupported());
+        vtkOpenXRManager::GetInstance().IsFBPassthroughSupported());
   }
 #endif
 
@@ -716,7 +731,7 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
     this->InteractorStyleDelegate->SetMagnification(magnification);
 
     // Dolly physical speed
-    double dollyPhysicalSpeedMps = this ->MRMLVirtualRealityViewNode->GetMotionSpeed();
+    double dollyPhysicalSpeedMps = this->MRMLVirtualRealityViewNode->GetMotionSpeed();
 
     // 1.6666 m/s is walking speed (= 6 km/h), which is the default. We multiply it with the factor
     this->InteractorStyle->SetDollyPhysicalSpeed(dollyPhysicalSpeedMps);
@@ -762,6 +777,8 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
           static_cast<float>(this->MRMLVirtualRealityViewNode->GetOccludedOpacity()));
         xrRenderWindow->SetShowEnvDepthDebugVisualization(
           this->MRMLVirtualRealityViewNode->GetEnvDepthDebugVisualization());
+        // Note: CaptureEnvironmentDepth must be set before session creation (in createRenderWindow).
+        // Updating it here has no effect on an already-running session.
       }
     }
 #endif
@@ -774,6 +791,17 @@ void qMRMLVirtualRealityViewPrivate::updateWidgetFromMRMLNoModify()
   else
   {
     this->VirtualRealityLoopTimer.stop();
+  }
+
+  // Ensure volume nodes exist as soon as the capture flags are toggled on,
+  // regardless of whether data is currently flowing.
+  if (this->MRMLVirtualRealityViewNode->GetPassthroughDepthVolumeEnabled())
+  {
+    this->VirtualRealityLogic->GetOrCreatePassthroughDepthVolumeNode();
+  }
+  if (this->MRMLVirtualRealityViewNode->GetVRSceneColorVolumeEnabled())
+  {
+    this->VirtualRealityLogic->GetOrCreateVRSceneColorVolumeNode();
   }
 }
 
@@ -827,24 +855,28 @@ void qMRMLVirtualRealityViewPrivate::doOpenVirtualReality()
 #endif
   if (this->RenderWindow->GetVRInitialized() && hmdConnected)
   {
+    // Reset staging flags so onRendererEndEvent() captures fresh data this frame.
+    this->ColorStagingHasData = false;
+    this->DepthStagingHasData = false;
+
     this->Interactor->DoOneEvent(this->RenderWindow, this->Renderer);
 
     this->LastViewUpdateTime->StopTimer();
     if (this->LastViewUpdateTime->GetElapsedTime() > 0.0)
     {
       bool quickViewMotion =
-          vtkSlicerVirtualRealityLogic::ShouldConsiderQuickViewMotion(
-            this->MRMLVirtualRealityViewNode->GetMotionSensitivity(),
-            this->RenderWindow->GetPhysicalScale(),
-            this->LastViewUpdateTime->GetElapsedTime(),
-            // position and orientation since last view update
-            this->LastViewPosition,
-            this->LastViewDirection,
-            this->LastViewUp,
-            // current view position and orientation
-            this->Camera->GetPosition(),
-            this->Camera->GetViewPlaneNormal(),
-            this->Camera->GetViewUp());
+        vtkSlicerVirtualRealityLogic::ShouldConsiderQuickViewMotion(
+          this->MRMLVirtualRealityViewNode->GetMotionSensitivity(),
+          this->RenderWindow->GetPhysicalScale(),
+          this->LastViewUpdateTime->GetElapsedTime(),
+          // position and orientation since last view update
+          this->LastViewPosition,
+          this->LastViewDirection,
+          this->LastViewUp,
+          // current view position and orientation
+          this->Camera->GetPosition(),
+          this->Camera->GetViewPlaneNormal(),
+          this->Camera->GetViewUp());
 
       double updateRate = quickViewMotion ? this->desiredUpdateRate() : this->stillUpdateRate();
       this->RenderWindow->SetDesiredUpdateRate(updateRate);
@@ -868,6 +900,12 @@ void qMRMLVirtualRealityViewPrivate::doOpenVirtualReality()
       if (this->MRMLVirtualRealityViewNode->GetTrackerTransformUpdate())
       {
         updateTransformNodesWithTrackerPoses();
+      }
+
+      if (this->MRMLVirtualRealityViewNode->GetVRSceneColorVolumeEnabled() ||
+        this->MRMLVirtualRealityViewNode->GetPassthroughDepthVolumeEnabled())
+      {
+        this->updatePassthroughVolumeNodes();
       }
 
       this->LastViewUpdateTime->StartTimer();
@@ -925,6 +963,182 @@ void qMRMLVirtualRealityViewPrivate::updateTransformNodesWithTrackerPoses()
 }
 
 //----------------------------------------------------------------------------
+void qMRMLVirtualRealityViewPrivate::onRendererEndEvent()
+{
+  if (!this->MRMLVirtualRealityViewNode)
+  {
+    return;
+  }
+
+  // --- Color (left-eye rendered frame) ---
+  if (this->MRMLVirtualRealityViewNode->GetVRSceneColorVolumeEnabled()
+    && !this->ColorStagingHasData)
+  {
+    GLint viewport[4] = { 0, 0, 0, 0 };
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    int w = viewport[2];
+    int h = viewport[3];
+    if (w > 0 && h > 0)
+    {
+      this->ColorStaging.resize(static_cast<size_t>(w) * h * 3);
+      glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, this->ColorStaging.data());
+      this->ColorStagingWidth = w;
+      this->ColorStagingHeight = h;
+      this->ColorStagingHasData = true;
+    }
+  }
+
+  // --- Depth (XR_META_environment_depth, left eye, layer 0) ---
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+  if (this->MRMLVirtualRealityViewNode->GetPassthroughDepthVolumeEnabled()
+    && !this->DepthStagingHasData)
+  {
+#ifdef XR_META_environment_depth
+    vtkOpenXRManager& mgr = vtkOpenXRManager::GetInstance();
+    if (mgr.IsEnvironmentDepthActive())
+    {
+      uint32_t texId = mgr.GetEnvDepthTextureId();
+      if (texId != 0)
+      {
+        // DSA query — no bind needed, works regardless of texture target.
+        GLint w = 0, h = 0;
+        glGetTextureLevelParameteriv(texId, 0, GL_TEXTURE_WIDTH, &w);
+        glGetTextureLevelParameteriv(texId, 0, GL_TEXTURE_HEIGHT, &h);
+
+        if (w > 0 && h > 0)
+        {
+          // Build or reuse the staging FBO.
+          // No staging texture needed — we read directly from the depth
+          // attachment via GL_DEPTH_COMPONENT.
+          if (this->DepthBlitFBO == 0)
+          {
+            glGenFramebuffers(1, &this->DepthBlitFBO);
+          }
+
+          // Save current FBO state before touching anything
+          GLint prevFBO = 0;
+          glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFBO);
+
+          glBindFramebuffer(GL_FRAMEBUFFER, this->DepthBlitFBO);
+
+          // Attach layer 0 (left eye) of the XR depth texture as the
+          // depth attachment — this is the only attach mode that works
+          // for a depth-format swapchain texture on this runtime.
+          glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+            texId, 0 /*mip*/, 0 /*layer=left eye*/);
+
+          GLenum fbStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+          if (fbStatus != GL_FRAMEBUFFER_COMPLETE)
+          {
+            qWarning() << "EnvDepth: FBO incomplete: 0x" << Qt::hex << fbStatus;
+          }
+          else
+          {
+            // Flush any pre-existing GL errors before our readback
+            while (glGetError() != GL_NO_ERROR) {}
+
+            this->DepthStaging.resize(static_cast<size_t>(w) * h);
+            glReadPixels(0, 0, w, h, GL_DEPTH_COMPONENT, GL_FLOAT,
+              this->DepthStaging.data());
+
+            GLenum err = glGetError();
+            if (err != GL_NO_ERROR)
+            {
+              qWarning() << "EnvDepth glReadPixels failed: 0x" << Qt::hex << err;
+            }
+            else
+            {
+              // Convert metres → millimetres.
+              for (float& v : this->DepthStaging)
+              {
+                v *= 1000.0f;
+              }
+              this->DepthStagingWidth = w;
+              this->DepthStagingHeight = h;
+              this->DepthStagingHasData = true;
+            }
+          }
+
+          // Detach and restore XR texture
+          glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, 0, 0, 0);
+          glBindFramebuffer(GL_FRAMEBUFFER, prevFBO);
+        }
+      }
+    }
+#endif // XR_META_environment_depth
+  }
+#endif // SlicerVirtualReality_HAS_OPENXR_SUPPORT
+}
+
+//----------------------------------------------------------------------------
+// Copy from CPU staging buffers (filled during rendering) into MRML volume
+// nodes.  No OpenGL calls are made here — the swapchain images have already
+// been released at this point.
+void qMRMLVirtualRealityViewPrivate::updatePassthroughVolumeNodes()
+{
+  if (!this->MRMLVirtualRealityViewNode)
+  {
+    return;
+  }
+
+  // --- Depth volume ---
+  if (this->MRMLVirtualRealityViewNode->GetPassthroughDepthVolumeEnabled()
+    && this->DepthStagingHasData)
+  {
+    vtkMRMLScalarVolumeNode* volNode =
+      this->VirtualRealityLogic->GetOrCreatePassthroughDepthVolumeNode();
+    if (volNode)
+    {
+      vtkImageData* img = volNode->GetImageData();
+      if (!img ||
+        img->GetDimensions()[0] != this->DepthStagingWidth ||
+        img->GetDimensions()[1] != this->DepthStagingHeight)
+      {
+        vtkNew<vtkImageData> newImg;
+        newImg->SetDimensions(this->DepthStagingWidth, this->DepthStagingHeight, 1);
+        newImg->AllocateScalars(VTK_FLOAT, 1);
+        volNode->SetAndObserveImageData(newImg);
+        img = volNode->GetImageData();
+      }
+      memcpy(img->GetScalarPointer(),
+        this->DepthStaging.data(),
+        this->DepthStaging.size() * sizeof(float));
+      img->Modified();
+      volNode->Modified();
+    }
+    this->DepthStagingHasData = false;
+  }
+
+  // --- Color volume ---
+  if (this->MRMLVirtualRealityViewNode->GetVRSceneColorVolumeEnabled()
+    && this->ColorStagingHasData)
+  {
+    vtkMRMLVectorVolumeNode* volNode =
+      this->VirtualRealityLogic->GetOrCreateVRSceneColorVolumeNode();
+    if (volNode)
+    {
+      vtkImageData* img = volNode->GetImageData();
+      if (!img ||
+        img->GetDimensions()[0] != this->ColorStagingWidth ||
+        img->GetDimensions()[1] != this->ColorStagingHeight)
+      {
+        vtkNew<vtkImageData> newImg;
+        newImg->SetDimensions(this->ColorStagingWidth, this->ColorStagingHeight, 1);
+        newImg->AllocateScalars(VTK_UNSIGNED_CHAR, 3);
+        volNode->SetAndObserveImageData(newImg);
+        img = volNode->GetImageData();
+      }
+      memcpy(img->GetScalarPointer(),
+        this->ColorStaging.data(),
+        this->ColorStaging.size());
+      img->Modified();
+      volNode->Modified();
+    }
+    this->ColorStagingHasData = false;
+  }
+}
+
+//----------------------------------------------------------------------------
 void qMRMLVirtualRealityViewPrivate
 ::updateTransformNodeAttributesFromDevice(vtkMRMLTransformNode* node, vtkEventDataDevice device, uint32_t index)
 {
@@ -937,23 +1151,23 @@ void qMRMLVirtualRealityViewPrivate
 
   std::string attributePrefix;
 
-  switch(device)
+  switch (device)
   {
-    case vtkEventDataDevice::HeadMountedDisplay:
-      attributePrefix = "HMD";
-      break;
-    case vtkEventDataDevice::RightController:
-      attributePrefix = "Controller";
-      break;
-    case vtkEventDataDevice::LeftController:
-      attributePrefix = "Controller";
-      break;
-    case vtkEventDataDevice::GenericTracker:
-      attributePrefix = "Tracker";
-      break;
-    default:
-      attributePrefix = "Unknown";
-      break;
+  case vtkEventDataDevice::HeadMountedDisplay:
+    attributePrefix = "HMD";
+    break;
+  case vtkEventDataDevice::RightController:
+    attributePrefix = "Controller";
+    break;
+  case vtkEventDataDevice::LeftController:
+    attributePrefix = "Controller";
+    break;
+  case vtkEventDataDevice::GenericTracker:
+    attributePrefix = "Tracker";
+    break;
+  default:
+    attributePrefix = "Unknown";
+    break;
   }
 
   vr::TrackedDevicePose_t* tdPose;
@@ -961,24 +1175,24 @@ void qMRMLVirtualRealityViewPrivate
   if (tdPose == nullptr)
   {
     auto handle = this->RenderWindow->GetDeviceHandleForDevice(device, index);
-    switch(device)
+    switch (device)
     {
-      case vtkEventDataDevice::HeadMountedDisplay:
-        qCritical() << Q_FUNC_INFO << ": Unable to retrieve HMD pose";
-        break;
-      case vtkEventDataDevice::RightController:
-        qCritical() << Q_FUNC_INFO << ": Unable to retrieve RightController pose";
-        break;
-      case vtkEventDataDevice::LeftController:
-        qCritical() << Q_FUNC_INFO << ": Unable to retrieve LeftController pose";
-        break;
-      case vtkEventDataDevice::GenericTracker:
-        qCritical() << Q_FUNC_INFO << ": Unable to retrieve pose associated with VR tracker"
-                    << "(index: " << index << ", handle: " << handle << ")";
-        break;
-      default:
-        qCritical() << Q_FUNC_INFO << ": Unable to retrieve pose associated with unknown device";
-        break;
+    case vtkEventDataDevice::HeadMountedDisplay:
+      qCritical() << Q_FUNC_INFO << ": Unable to retrieve HMD pose";
+      break;
+    case vtkEventDataDevice::RightController:
+      qCritical() << Q_FUNC_INFO << ": Unable to retrieve RightController pose";
+      break;
+    case vtkEventDataDevice::LeftController:
+      qCritical() << Q_FUNC_INFO << ": Unable to retrieve LeftController pose";
+      break;
+    case vtkEventDataDevice::GenericTracker:
+      qCritical() << Q_FUNC_INFO << ": Unable to retrieve pose associated with VR tracker"
+        << "(index: " << index << ", handle: " << handle << ")";
+      break;
+    default:
+      qCritical() << Q_FUNC_INFO << ": Unable to retrieve pose associated with unknown device";
+      break;
     }
     return;
   }
@@ -1007,9 +1221,9 @@ void qMRMLVirtualRealityViewPrivate
 {
   auto deviceHandle = this->RenderWindow->GetDeviceHandleForDevice(device, index);
   if (deviceHandle == UINT32_MAX /* InvalidDeviceIndex or vr::k_unTrackedDeviceIndexInvalid */)
-    {
+  {
     return;
-    }
+  }
   vtkMatrix4x4* pose = this->RenderWindow->GetDeviceToPhysicalMatrixForDeviceHandle(deviceHandle);
   if (!pose)
   {
@@ -1037,7 +1251,7 @@ void qMRMLVirtualRealityViewPrivate
 
 // --------------------------------------------------------------------------
 qMRMLVirtualRealityView::qMRMLVirtualRealityView(QWidget* _parent) : Superclass(_parent)
-  , d_ptr(new qMRMLVirtualRealityViewPrivate(*this))
+, d_ptr(new qMRMLVirtualRealityViewPrivate(*this))
 {
   Q_D(qMRMLVirtualRealityView);
   d->init();
@@ -1204,11 +1418,11 @@ void qMRMLVirtualRealityView::onButton3DEvent(vtkObject* caller, void* call_data
   Q_UNUSED(vtk_event);
   Q_UNUSED(client_data);
 
-  vtkEventDataDevice3D * ed = reinterpret_cast<vtkEventDataDevice3D*>(call_data);
+  vtkEventDataDevice3D* ed = reinterpret_cast<vtkEventDataDevice3D*>(call_data);
 
-  if(ed->GetInput() == vtkEventDataDeviceInput::Trigger)
+  if (ed->GetInput() == vtkEventDataDeviceInput::Trigger)
   {
-    if(ed->GetDevice() == vtkEventDataDevice::LeftController)
+    if (ed->GetDevice() == vtkEventDataDevice::LeftController)
     {
       if (ed->GetAction() == vtkEventDataAction::Press)
       {
@@ -1262,7 +1476,7 @@ void qMRMLVirtualRealityView::onButton3DEvent(vtkObject* caller, void* call_data
     {
       if (ed->GetAction() == vtkEventDataAction::Press)
       {
-        emit leftControllerTrackpadPressed(ed->GetTrackPadPosition()[0],ed->GetTrackPadPosition()[1]);
+        emit leftControllerTrackpadPressed(ed->GetTrackPadPosition()[0], ed->GetTrackPadPosition()[1]);
       }
       else if (ed->GetAction() == vtkEventDataAction::Release)
       {

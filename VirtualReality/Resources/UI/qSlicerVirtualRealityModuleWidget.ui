@@ -134,13 +134,53 @@
        </widget>
       </item>
       <item row="5" column="0">
+       <widget class="QLabel" name="VRSceneColorVolumeLabel">
+        <property name="text">
+         <string>VR scene color volume:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="1">
+       <widget class="QCheckBox" name="VRSceneColorVolumeCheckBox">
+        <property name="toolTip">
+         <string>Capture the rendered left-eye VR scene each tick into a vtkMRMLVectorVolumeNode named "VR Scene (Left Eye)" (RGB). This captures the composited output of the VR renderer, not the raw headset camera feed.</string>
+        </property>
+        <property name="text">
+         <string/>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="0">
+       <widget class="QLabel" name="PassthroughDepthVolumeLabel">
+        <property name="text">
+         <string>Passthrough depth volume:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="6" column="1">
+       <widget class="QCheckBox" name="PassthroughDepthVolumeCheckBox">
+        <property name="toolTip">
+         <string>Capture the real-world environment depth (XR_META_environment_depth) each tick into a vtkMRMLScalarVolumeNode named "Passthrough Depth". Values are in millimetres. Requires XR_META_environment_depth support.</string>
+        </property>
+        <property name="text">
+         <string/>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="7" column="0">
        <widget class="QLabel" name="ConnectToHardwareLabel">
         <property name="text">
          <string>Connect to hardware:</string>
         </property>
        </widget>
       </item>
-      <item row="5" column="1">
+      <item row="7" column="1">
        <layout class="QHBoxLayout" name="ConnectionLayout">
         <item>
          <widget class="ctkCheckBox" name="ConnectCheckBox"/>
@@ -197,14 +237,14 @@
         </item>
        </layout>
       </item>
-      <item row="6" column="0">
+      <item row="8" column="0">
        <widget class="QLabel" name="EnableRenderingLabel">
         <property name="text">
          <string>Enable rendering:</string>
         </property>
        </widget>
       </item>
-      <item row="6" column="1">
+      <item row="8" column="1">
        <widget class="ctkCheckBox" name="RenderingEnabledCheckBox"/>
       </item>
      </layout>

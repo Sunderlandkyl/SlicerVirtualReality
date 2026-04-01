@@ -96,6 +96,8 @@ void qSlicerVirtualRealityModuleWidget::setup()
   connect(d->RemotingEnabledCheckBox, SIGNAL(toggled(bool)), this, SLOT(setRemotingEnabled(bool)));
   connect(d->PlayerIPAddressLineEdit, SIGNAL(editingFinished()), this, SLOT(onPlayerIPAddressLineEditEditingFinished()));
   connect(d->PassthroughEnabledCheckBox, SIGNAL(toggled(bool)), this, SLOT(setPassthroughEnabled(bool)));
+  connect(d->VRSceneColorVolumeCheckBox, SIGNAL(toggled(bool)), this, SLOT(setVRSceneColorVolumeEnabled(bool)));
+  connect(d->PassthroughDepthVolumeCheckBox, SIGNAL(toggled(bool)), this, SLOT(setPassthroughDepthVolumeEnabled(bool)));
   connect(d->OccludedOpacitySlider, SIGNAL(valueChanged(double)), this, SLOT(onOccludedOpacityChanged(double)));
   connect(d->EnvDepthDebugCheckBox, SIGNAL(toggled(bool)), this, SLOT(setEnvDepthDebugVisualization(bool)));
 
@@ -266,6 +268,21 @@ void qSlicerVirtualRealityModuleWidget::updateWidgetFromMRML()
   d->EnvDepthDebugCheckBox->setEnabled(vrViewNode != nullptr
         && vrViewNode->GetXRBackend() == vtkMRMLVirtualRealityViewNode::OpenXR);
   d->EnvDepthDebugCheckBox->blockSignals(wasBlocked);
+
+  // VR scene color volume capture
+  wasBlocked = d->VRSceneColorVolumeCheckBox->blockSignals(true);
+  d->VRSceneColorVolumeCheckBox->setChecked(
+    vrViewNode != nullptr ? vrViewNode->GetVRSceneColorVolumeEnabled() : false);
+  d->VRSceneColorVolumeCheckBox->setEnabled(vrViewNode != nullptr && vrLogic->GetVirtualRealityActive());
+  d->VRSceneColorVolumeCheckBox->blockSignals(wasBlocked);
+
+  wasBlocked = d->PassthroughDepthVolumeCheckBox->blockSignals(true);
+  d->PassthroughDepthVolumeCheckBox->setChecked(
+    vrViewNode != nullptr ? vrViewNode->GetPassthroughDepthVolumeEnabled() : false);
+  d->PassthroughDepthVolumeCheckBox->setEnabled(vrViewNode != nullptr
+        && vrViewNode->GetXRBackend() == vtkMRMLVirtualRealityViewNode::OpenXR
+        && vrLogic->GetVirtualRealityActive());
+  d->PassthroughDepthVolumeCheckBox->blockSignals(wasBlocked);
 }
 
 
@@ -511,6 +528,28 @@ void qSlicerVirtualRealityModuleWidget::setPassthroughEnabled(bool enabled)
   if (vrViewNode)
   {
     vrViewNode->SetPassthrough(enabled);
+  }
+}
+
+//----------------------------------------------------------------------------
+void qSlicerVirtualRealityModuleWidget::setVRSceneColorVolumeEnabled(bool enabled)
+{
+  vtkSlicerVirtualRealityLogic* vrLogic = vtkSlicerVirtualRealityLogic::SafeDownCast(this->logic());
+  vtkMRMLVirtualRealityViewNode* vrViewNode = vrLogic->GetVirtualRealityViewNode();
+  if (vrViewNode)
+  {
+    vrViewNode->SetVRSceneColorVolumeEnabled(enabled);
+  }
+}
+
+//----------------------------------------------------------------------------
+void qSlicerVirtualRealityModuleWidget::setPassthroughDepthVolumeEnabled(bool enabled)
+{
+  vtkSlicerVirtualRealityLogic* vrLogic = vtkSlicerVirtualRealityLogic::SafeDownCast(this->logic());
+  vtkMRMLVirtualRealityViewNode* vrViewNode = vrLogic->GetVirtualRealityViewNode();
+  if (vrViewNode)
+  {
+    vrViewNode->SetPassthroughDepthVolumeEnabled(enabled);
   }
 }
 
