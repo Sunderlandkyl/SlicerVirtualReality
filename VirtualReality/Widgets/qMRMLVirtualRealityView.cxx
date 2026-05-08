@@ -507,6 +507,24 @@ void qMRMLVirtualRealityViewPrivate::createRenderWindow(vtkMRMLVirtualRealityVie
 void qMRMLVirtualRealityViewPrivate::destroyRenderWindow()
 {
   this->VirtualRealityLoopTimer.stop();
+
+  // Release OpenGL resources that we own while the render window's
+  // GL context is still valid.
+  if (this->RenderWindow != nullptr)
+  {
+    this->RenderWindow->MakeCurrent();
+    if (this->DepthBlitFBO != 0)
+    {
+      glDeleteFramebuffers(1, &this->DepthBlitFBO);
+      this->DepthBlitFBO = 0;
+    }
+    if (this->DepthBlitTexture != 0)
+    {
+      glDeleteTextures(1, &this->DepthBlitTexture);
+      this->DepthBlitTexture = 0;
+    }
+  }
+
   // Must break the connection between interactor and render window,
   // otherwise they would circularly refer to each other and would not
   // be deleted.
