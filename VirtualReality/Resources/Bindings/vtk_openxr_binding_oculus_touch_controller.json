@@ -23,6 +23,22 @@
         {
           "inputs": {
             "pose": {
+              "output": "handposegrip"
+            }
+          },
+          "path": "/user/hand/left/input/grip"
+        },
+        {
+          "inputs": {
+            "pose": {
+              "output": "handposegrip"
+            }
+          },
+          "path": "/user/hand/right/input/grip"
+        },
+        {
+          "inputs": {
+            "pose": {
               "output": "handpose"
             }
           },
