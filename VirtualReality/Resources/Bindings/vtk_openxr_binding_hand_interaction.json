@@ -1,0 +1,234 @@
+{
+  "interaction_profile": "/interaction_profiles/ext/hand_interaction_ext",
+
+  "bindings": {
+    "vtk-actions": {
+      "sources": [
+        {
+          "inputs": {
+            "pose": {
+              "output": "left_grip_pose"
+            }
+          },
+          "path": "/user/hand/left/input/grip"
+        },
+        {
+          "inputs": {
+            "pose": {
+              "output": "right_grip_pose"
+            }
+          },
+          "path": "/user/hand/right/input/grip"
+        },
+        {
+          "inputs": {
+            "pose": {
+              "output": "handpose"
+            }
+          },
+          "path": "/user/hand/left/input/aim"
+        },
+        {
+          "inputs": {
+            "pose": {
+              "output": "left_aim_pose"
+            }
+          },
+          "path": "/user/hand/left/input/aim"
+        },
+        {
+          "inputs": {
+            "pose": {
+              "output": "handpose"
+            }
+          },
+          "path": "/user/hand/right/input/aim"
+        },
+        {
+          "inputs": {
+            "pose": {
+              "output": "right_aim_pose"
+            }
+          },
+          "path": "/user/hand/right/input/aim"
+        },
+        {
+          "inputs": {
+            "pose": {
+              "output": "left_pinch_pose"
+            }
+          },
+          "path": "/user/hand/left/input/pinch_ext"
+        },
+        {
+          "inputs": {
+            "pose": {
+              "output": "right_pinch_pose"
+            }
+          },
+          "path": "/user/hand/right/input/pinch_ext"
+        },
+        {
+          "inputs": {
+            "pose": {
+              "output": "left_poke_pose"
+            }
+          },
+          "path": "/user/hand/left/input/poke_ext"
+        },
+        {
+          "inputs": {
+            "pose": {
+              "output": "right_poke_pose"
+            }
+          },
+          "path": "/user/hand/right/input/poke_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "left_pinch_value"
+            }
+          },
+          "path": "/user/hand/left/input/pinch_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "right_pinch_value"
+            }
+          },
+          "path": "/user/hand/right/input/pinch_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "left_pinch_click"
+            }
+          },
+          "path": "/user/hand/left/input/pinch_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "right_pinch_click"
+            }
+          },
+          "path": "/user/hand/right/input/pinch_ext"
+        },
+        {
+          "inputs": {
+            "ready_ext": {
+              "output": "left_pinch_ready"
+            }
+          },
+          "path": "/user/hand/left/input/pinch_ext"
+        },
+        {
+          "inputs": {
+            "ready_ext": {
+              "output": "right_pinch_ready"
+            }
+          },
+          "path": "/user/hand/right/input/pinch_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "left_grasp_value"
+            }
+          },
+          "path": "/user/hand/left/input/grasp_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "right_grasp_value"
+            }
+          },
+          "path": "/user/hand/right/input/grasp_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "left_grasp_click"
+            }
+          },
+          "path": "/user/hand/left/input/grasp_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "right_grasp_click"
+            }
+          },
+          "path": "/user/hand/right/input/grasp_ext"
+        },
+        {
+          "inputs": {
+            "ready_ext": {
+              "output": "left_grasp_ready"
+            }
+          },
+          "path": "/user/hand/left/input/grasp_ext"
+        },
+        {
+          "inputs": {
+            "ready_ext": {
+              "output": "right_grasp_ready"
+            }
+          },
+          "path": "/user/hand/right/input/grasp_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "left_aim_activate_value"
+            }
+          },
+          "path": "/user/hand/left/input/aim_activate_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "right_aim_activate_value"
+            }
+          },
+          "path": "/user/hand/right/input/aim_activate_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "left_aim_activate_click"
+            }
+          },
+          "path": "/user/hand/left/input/aim_activate_ext"
+        },
+        {
+          "inputs": {
+            "value": {
+              "output": "right_aim_activate_click"
+            }
+          },
+          "path": "/user/hand/right/input/aim_activate_ext"
+        },
+        {
+          "inputs": {
+            "ready_ext": {
+              "output": "left_aim_activate_ready"
+            }
+          },
+          "path": "/user/hand/left/input/aim_activate_ext"
+        },
+        {
+          "inputs": {
+            "ready_ext": {
+              "output": "right_aim_activate_ready"
+            }
+          },
+          "path": "/user/hand/right/input/aim_activate_ext"
+        }
+      ]
+    }
+  }
+}

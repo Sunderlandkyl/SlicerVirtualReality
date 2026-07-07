@@ -21,6 +21,32 @@
     { "name": "left_trigger_touch", "type": "boolean" },
     { "name": "right_trigger_touch", "type": "boolean" },
 
+    { "name": "left_pinch_pose", "type": "pose" },
+    { "name": "right_pinch_pose", "type": "pose" },
+    { "name": "left_poke_pose", "type": "pose" },
+    { "name": "right_poke_pose", "type": "pose" },
+
+    { "name": "left_pinch_value", "type": "float" },
+    { "name": "right_pinch_value", "type": "float" },
+    { "name": "left_pinch_click", "type": "boolean" },
+    { "name": "right_pinch_click", "type": "boolean" },
+    { "name": "left_pinch_ready", "type": "boolean" },
+    { "name": "right_pinch_ready", "type": "boolean" },
+
+    { "name": "left_grasp_value", "type": "float" },
+    { "name": "right_grasp_value", "type": "float" },
+    { "name": "left_grasp_click", "type": "boolean" },
+    { "name": "right_grasp_click", "type": "boolean" },
+    { "name": "left_grasp_ready", "type": "boolean" },
+    { "name": "right_grasp_ready", "type": "boolean" },
+
+    { "name": "left_aim_activate_value", "type": "float" },
+    { "name": "right_aim_activate_value", "type": "float" },
+    { "name": "left_aim_activate_click", "type": "boolean" },
+    { "name": "right_aim_activate_click", "type": "boolean" },
+    { "name": "left_aim_activate_ready", "type": "boolean" },
+    { "name": "right_aim_activate_ready", "type": "boolean" },
+
     { "name": "left_thumbstick", "type": "vector2" },
     { "name": "right_thumbstick", "type": "vector2" },
     { "name": "left_thumbstick_click", "type": "boolean" },
@@ -47,6 +73,10 @@
     {
       "binding_url": "vtk_openxr_binding_oculus_touch_controller.json",
       "controller_type": "oculus_touch"
+    },
+    {
+      "binding_url": "vtk_openxr_binding_hand_interaction.json",
+      "controller_type": "hand_interaction_ext"
     }
   ],
   "action_sets": [
@@ -74,6 +104,32 @@
       "right_trigger_click": "Right Trigger Click",
       "left_trigger_touch": "Left Trigger Touch",
       "right_trigger_touch": "Right Trigger Touch",
+
+      "left_pinch_pose": "Left Pinch Pose",
+      "right_pinch_pose": "Right Pinch Pose",
+      "left_poke_pose": "Left Poke Pose",
+      "right_poke_pose": "Right Poke Pose",
+
+      "left_pinch_value": "Left Pinch Value",
+      "right_pinch_value": "Right Pinch Value",
+      "left_pinch_click": "Left Pinch Click",
+      "right_pinch_click": "Right Pinch Click",
+      "left_pinch_ready": "Left Pinch Ready",
+      "right_pinch_ready": "Right Pinch Ready",
+
+      "left_grasp_value": "Left Grasp Value",
+      "right_grasp_value": "Right Grasp Value",
+      "left_grasp_click": "Left Grasp Click",
+      "right_grasp_click": "Right Grasp Click",
+      "left_grasp_ready": "Left Grasp Ready",
+      "right_grasp_ready": "Right Grasp Ready",
+
+      "left_aim_activate_value": "Left Aim Activate Value",
+      "right_aim_activate_value": "Right Aim Activate Value",
+      "left_aim_activate_click": "Left Aim Activate Click",
+      "right_aim_activate_click": "Right Aim Activate Click",
+      "left_aim_activate_ready": "Left Aim Activate Ready",
+      "right_aim_activate_ready": "Right Aim Activate Ready",
 
       "left_thumbstick": "Left Thumbstick",
       "right_thumbstick": "Right Thumbstick",

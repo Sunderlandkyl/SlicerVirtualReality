@@ -25,7 +25,13 @@
 #include <vtkOpenXRRenderWindowInteractor.h>
 
 // VTK includes
+#include <vtkActor.h>
+#include <vtkConeSource.h>
+#include <vtkNew.h>
 #include <vtkObjectFactory.h>
+#include <vtkPolyDataMapper.h>
+#include <vtkProperty.h>
+#include <vtkRenderer.h>
 
 //----------------------------------------------------------------------------
 vtkStandardNewMacro(vtkVirtualRealityViewOpenXRInteractorStyle);
@@ -37,6 +43,25 @@ vtkVirtualRealityViewOpenXRInteractorStyle::vtkVirtualRealityViewOpenXRInteracto
   this->ControllerEventCallbackCommand->SetClientData(this);
   this->ControllerEventCallbackCommand->SetCallback(
     vtkVirtualRealityViewOpenXRInteractorStyle::ProcessControllerEvents);
+}
+
+//----------------------------------------------------------------------------
+vtkVirtualRealityViewOpenXRInteractorStyle::~vtkVirtualRealityViewOpenXRInteractorStyle()
+{
+  // Defensive: remove the indicator actors from whatever renderer they were added to, in case a
+  // future refactoring keeps the renderer alive longer than this interactor style instance.
+  vtkRenderer* renderer = this->GetCurrentRenderer();
+  if (renderer)
+  {
+    if (this->LeftHandIndicatorActor)
+    {
+      renderer->RemoveActor(this->LeftHandIndicatorActor);
+    }
+    if (this->RightHandIndicatorActor)
+    {
+      renderer->RemoveActor(this->RightHandIndicatorActor);
+    }
+  }
 }
 
 //----------------------------------------------------------------------------
@@ -69,6 +94,38 @@ void vtkVirtualRealityViewOpenXRInteractorStyle::SetupActions(vtkRenderWindowInt
   oiren->AddAction("right_trigger_click", static_cast<vtkCommand::EventIds>(RightTriggerClickEvent));
   oiren->AddAction("left_trigger_touch", static_cast<vtkCommand::EventIds>(LeftTriggerTouchEvent));
   oiren->AddAction("right_trigger_touch", static_cast<vtkCommand::EventIds>(RightTriggerTouchEvent));
+
+  oiren->AddAction("left_pinch_pose", static_cast<vtkCommand::EventIds>(LeftPinchPoseEvent));
+  oiren->AddAction("right_pinch_pose", static_cast<vtkCommand::EventIds>(RightPinchPoseEvent));
+  oiren->AddAction("left_poke_pose", static_cast<vtkCommand::EventIds>(LeftPokePoseEvent));
+  oiren->AddAction("right_poke_pose", static_cast<vtkCommand::EventIds>(RightPokePoseEvent));
+
+  oiren->AddAction("left_pinch_value", static_cast<vtkCommand::EventIds>(LeftPinchValueEvent));
+  oiren->AddAction("right_pinch_value", static_cast<vtkCommand::EventIds>(RightPinchValueEvent));
+  oiren->AddAction("left_pinch_click", static_cast<vtkCommand::EventIds>(LeftPinchClickEvent));
+  oiren->AddAction("right_pinch_click", static_cast<vtkCommand::EventIds>(RightPinchClickEvent));
+  oiren->AddAction("left_pinch_ready", static_cast<vtkCommand::EventIds>(LeftPinchReadyEvent));
+  oiren->AddAction("right_pinch_ready", static_cast<vtkCommand::EventIds>(RightPinchReadyEvent));
+
+  oiren->AddAction("left_grasp_value", static_cast<vtkCommand::EventIds>(LeftGraspValueEvent));
+  oiren->AddAction("right_grasp_value", static_cast<vtkCommand::EventIds>(RightGraspValueEvent));
+  oiren->AddAction("left_grasp_click", static_cast<vtkCommand::EventIds>(LeftGraspClickEvent));
+  oiren->AddAction("right_grasp_click", static_cast<vtkCommand::EventIds>(RightGraspClickEvent));
+  oiren->AddAction("left_grasp_ready", static_cast<vtkCommand::EventIds>(LeftGraspReadyEvent));
+  oiren->AddAction("right_grasp_ready", static_cast<vtkCommand::EventIds>(RightGraspReadyEvent));
+
+  oiren->AddAction(
+    "left_aim_activate_value", static_cast<vtkCommand::EventIds>(LeftAimActivateValueEvent));
+  oiren->AddAction(
+    "right_aim_activate_value", static_cast<vtkCommand::EventIds>(RightAimActivateValueEvent));
+  oiren->AddAction(
+    "left_aim_activate_click", static_cast<vtkCommand::EventIds>(LeftAimActivateClickEvent));
+  oiren->AddAction(
+    "right_aim_activate_click", static_cast<vtkCommand::EventIds>(RightAimActivateClickEvent));
+  oiren->AddAction(
+    "left_aim_activate_ready", static_cast<vtkCommand::EventIds>(LeftAimActivateReadyEvent));
+  oiren->AddAction(
+    "right_aim_activate_ready", static_cast<vtkCommand::EventIds>(RightAimActivateReadyEvent));
 
   oiren->AddAction("left_thumbstick", static_cast<vtkCommand::EventIds>(LeftThumbstickEvent));
   oiren->AddAction("right_thumbstick", static_cast<vtkCommand::EventIds>(RightThumbstickEvent));
@@ -103,6 +160,22 @@ void vtkVirtualRealityViewOpenXRInteractorStyle::SetupActions(vtkRenderWindowInt
     static_cast<unsigned long>(LeftGripClickEvent), this->ControllerEventCallbackCommand, this->Priority);
   oiren->AddObserver(
     static_cast<unsigned long>(RightGripClickEvent), this->ControllerEventCallbackCommand, this->Priority);
+
+  // Pinch-to-grab (hand tracking): thumb tip to index fingertip drives the same grab/move
+  // behavior as LeftGripClickEvent/RightGripClickEvent do for controllers.
+  oiren->AddObserver(
+    static_cast<unsigned long>(LeftPinchClickEvent), this->ControllerEventCallbackCommand, this->Priority);
+  oiren->AddObserver(
+    static_cast<unsigned long>(RightPinchClickEvent), this->ControllerEventCallbackCommand, this->Priority);
+
+  // Point-to-fly (hand tracking): LeftPokePoseEvent/RightPokePoseEvent alone drives flying, for
+  // as long as that hand's poke pose (fingertip-pointing direction) is tracked -- no separate
+  // click/grasp gesture gates it. See the LeftPokePoseEvent case in ProcessControllerEvents() and
+  // the doc comment in the header for the full rationale.
+  oiren->AddObserver(
+    static_cast<unsigned long>(LeftPokePoseEvent), this->ControllerEventCallbackCommand, this->Priority);
+  oiren->AddObserver(
+    static_cast<unsigned long>(RightPokePoseEvent), this->ControllerEventCallbackCommand, this->Priority);
 }
 
 //----------------------------------------------------------------------------
@@ -128,8 +201,70 @@ void vtkVirtualRealityViewOpenXRInteractorStyle::ProcessControllerEvents(
     break;
   case LeftGripClickEvent:
   case RightGripClickEvent:
+  case LeftPinchClickEvent:
+  case RightPinchClickEvent:
     interactor->InvokeEvent(vtkCommand::PositionProp3DEvent, callData);
     break;
+  case LeftPokePoseEvent:
+  case RightPokePoseEvent:
+  {
+    vtkEventDataDevice3D* edd = static_cast<vtkEventData*>(callData)->GetAsEventDataDevice3D();
+    if (!edd)
+    {
+      break;
+    }
+    bool isLeftHand = (event == LeftPokePoseEvent);
+    // No separate click/grasp gesture gates flying: LeftPokePoseEvent/RightPokePoseEvent alone
+    // drives it, for as long as that hand's poke pose (fingertip-pointing direction) is tracked.
+    // vtkOpenXRRenderWindowInteractor::HandlePoseAction() only invokes this event at all while
+    // pose.isActive is true (unconditionally every frame in that case, unlike a boolean action),
+    // and never invokes it once inactive -- so there is no separate "stop" event to react to;
+    // flying simply stops being driven the moment this event stops arriving (hand no longer
+    // tracked/pointing).
+    self->UpdateHandIndicatorPose(isLeftHand, edd);
+    self->SetHandIndicatorActive(isLeftHand, true);
+
+    bool& flyStarted = isLeftHand ? self->LeftFlyActive : self->RightFlyActive;
+    if (!flyStarted)
+    {
+      // Enter VTKIS_DOLLY once, the first time this hand's poke pose is seen. StartAction()
+      // only reads edd->GetDevice() and the explicit state argument (VTKIS_DOLLY), never
+      // edd->GetAction(), so it is safe to call here even though HandlePoseAction() never sets
+      // that field (see the \warning below on why the per-frame synthetic event further down
+      // still avoids reading it).
+      flyStarted = true;
+      self->StartAction(VTKIS_DOLLY, edd);
+    }
+
+    // Build a fresh event instead of forwarding edd/callData directly: edd is the ONE shared
+    // per-hand event object that vtkOpenXRRenderWindowInteractor::PollXrActions() mutates for
+    // EVERY action dispatched to this hand this frame, and only HandleBooleanAction() ever
+    // touches its Action field -- so it could be carrying a stale Press/Release value left by
+    // an unrelated boolean action processed earlier in this frame's dispatch loop. A freshly
+    // constructed vtkEventDataDevice3D defaults its Action to vtkEventDataAction::Unknown,
+    // which is neither Press nor Release, so vtkVRInteractorStyle::Movement3D() falls through
+    // to its "already in VTKIS_DOLLY -> call Dolly3D()" branch -- exactly mirroring how a
+    // continuously-deflected thumbstick drives repeated Dolly3D() calls.
+    vtkNew<vtkEventDataDevice3D> flyEvent;
+    flyEvent->SetDevice(edd->GetDevice());
+    flyEvent->SetInput(vtkEventDataDeviceInput::Trigger);
+    flyEvent->SetType(vtkCommand::ViewerMovement3DEvent);
+    flyEvent->SetWorldPosition(edd->GetWorldPosition());
+    flyEvent->SetWorldOrientation(edd->GetWorldOrientation());
+    flyEvent->SetWorldDirection(edd->GetWorldDirection());
+
+    // Fixed-speed forward flight: hand-tracking gestures have no analog throttle equivalent to
+    // the physical thumbstick's deflection amount.
+    //
+    // \warning LastTrackPadPosition and LastDolly3DEventTime (vtkInteractorStyle3D) are shared
+    // across ALL devices, not indexed per hand: if both hands are flying at once, their motion
+    // vector-sums rather than being tracked independently per hand. Accepted as v1 behavior.
+    self->LastTrackPadPosition[0] = 0.0;
+    self->LastTrackPadPosition[1] = 1.0;
+
+    interactor->InvokeEvent(vtkCommand::ViewerMovement3DEvent, flyEvent);
+    break;
+  }
   default:
     break;
   }
@@ -170,4 +305,58 @@ void vtkVirtualRealityViewOpenXRInteractorStyle::OnPositionProp3D(vtkEventData* 
   default:
     break;
   }
+}
+
+//----------------------------------------------------------------------------
+void vtkVirtualRealityViewOpenXRInteractorStyle::SetHandIndicatorActive(bool isLeftHand, bool active)
+{
+  vtkSmartPointer<vtkActor>& actor = isLeftHand ? this->LeftHandIndicatorActor : this->RightHandIndicatorActor;
+  if (!actor)
+  {
+    // Not created yet (no poke-pose update has been received for this hand yet); nothing to show.
+    return;
+  }
+  actor->SetVisibility(active);
+  // Bright green while flying; the actor is hidden the rest of the time so its idle color is
+  // never seen, but set something sane regardless.
+  actor->GetProperty()->SetColor(active ? 0.2 : 0.5, active ? 0.9 : 0.5, active ? 0.2 : 0.5);
+}
+
+//----------------------------------------------------------------------------
+void vtkVirtualRealityViewOpenXRInteractorStyle::UpdateHandIndicatorPose(
+  bool isLeftHand, vtkEventDataDevice3D* edd)
+{
+  vtkSmartPointer<vtkActor>& actor = isLeftHand ? this->LeftHandIndicatorActor : this->RightHandIndicatorActor;
+  if (!actor)
+  {
+    // Lazily create on first use: a renderer is not guaranteed to be attached to this interactor
+    // style yet at construction time (see SetCurrentRenderer() usage in qMRMLVirtualRealityView).
+    vtkRenderer* renderer = this->GetCurrentRenderer();
+    if (!renderer)
+    {
+      return;
+    }
+    vtkNew<vtkConeSource> coneSource;
+    coneSource->SetHeight(0.05);
+    coneSource->SetRadius(0.015);
+    coneSource->SetResolution(16);
+    // Point along -Z, matching the "forward" convention vtkInteractorStyle3D::Dolly3D() itself
+    // uses when building a direction vector from WorldOrientation.
+    coneSource->SetDirection(0.0, 0.0, -1.0);
+
+    vtkNew<vtkPolyDataMapper> mapper;
+    mapper->SetInputConnection(coneSource->GetOutputPort());
+
+    vtkNew<vtkActor> newActor;
+    newActor->SetMapper(mapper);
+    newActor->SetVisibility(false);
+    renderer->AddActor(newActor);
+    actor = newActor;
+  }
+
+  const double* wpos = edd->GetWorldPosition();
+  actor->SetPosition(wpos[0], wpos[1], wpos[2]);
+  const double* wori = edd->GetWorldOrientation();
+  actor->SetOrientation(0.0, 0.0, 0.0);
+  actor->RotateWXYZ(wori[0], wori[1], wori[2], wori[3]);
 }

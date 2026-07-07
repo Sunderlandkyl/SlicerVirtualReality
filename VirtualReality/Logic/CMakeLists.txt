@@ -36,6 +36,7 @@ if(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
   set(openxr_action_files
     vtk_openxr_actions.json
     vtk_openxr_binding_oculus_touch_controller.json
+    vtk_openxr_binding_hand_interaction.json
     )
   foreach(openxr_action_file ${openxr_action_files})
     configure_file(

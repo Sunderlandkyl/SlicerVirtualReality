@@ -144,13 +144,35 @@ Translate/rotate a selected object.
 
 ## How to use hand interaction
 
-See [Action poses for hand interactions](https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#ext_hand_interaction-the-four-action-poses)
+On Meta Quest 3, controllers can be set aside and bare hands used instead, using OpenXR's
+[hand interaction extension](https://registry.khronos.org/OpenXR/specs/1.1/html/xrspec.html#XR_EXT_hand_interaction).
+The same actions used for controllers (grab, pointing) are driven by hand poses/gestures instead,
+so no separate interaction mode needs to be selected.
 
 ### Transform objects
 
 Translate/rotate a selected object.
 
-Controls: do the "grip" or "pinch" pose when the hand is inside a selectable object
+Controls: pinch (touch your thumb and index finger together) while your hand is inside a
+selectable object to grab it, move your hand to translate/rotate the object, then release the
+pinch to let go.
+
+> [!NOTE]
+> - Requires enabling hand tracking on the headset (Quest Settings > Movement Tracking > Hand Tracking) and putting the controllers down.
+> - See [Transform objects](#transform-objects) above for notes on parent transforms and object selectability, which apply the same way here.
+
+### Fly
+
+Move around in space by pointing.
+
+Controls: simply point your index finger in the direction you want to travel -- flying starts
+immediately, no separate trigger gesture needed, for as long as your hand is tracked and pointing.
+A small green cone appears at your fingertip while flying, showing the direction you'll travel.
+
+> [!NOTE]
+> - Either hand can be used to fly. Using both hands at once is not recommended: since there is no
+>   thumbstick-style speed control for hand tracking, flying is always at a fixed speed, and using
+>   both hands simultaneously combines their directions rather than being tracked independently.
 
 ## Other features
 
