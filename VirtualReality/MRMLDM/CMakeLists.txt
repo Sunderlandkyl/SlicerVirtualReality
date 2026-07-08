@@ -34,6 +34,8 @@ if(SlicerVirtualReality_HAS_OPENVR_SUPPORT)
 endif()
 if(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
   list(APPEND ${KIT}_SRCS
+    vtk${MODULE_NAME}HandMeshVisualization.cxx
+    vtk${MODULE_NAME}HandMeshVisualization.h
     vtk${MODULE_NAME}ViewOpenXRInteractor.cxx
     vtk${MODULE_NAME}ViewOpenXRInteractor.h
     vtk${MODULE_NAME}ViewOpenXRInteractorStyle.cxx

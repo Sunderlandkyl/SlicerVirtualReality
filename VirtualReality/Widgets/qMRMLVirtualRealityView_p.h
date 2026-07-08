@@ -32,12 +32,21 @@
 // We mean it.
 //
 
+// For:
+//  - SlicerVirtualReality_HAS_OPENVR_SUPPORT
+//  - SlicerVirtualReality_HAS_OPENXR_SUPPORT
+//  - SlicerVirtualReality_HAS_OPENXRREMOTING_SUPPORT
+#include "vtkMRMLVirtualRealityConfigure.h"
+
 // VR MRML includes
 #include "vtkMRMLVirtualRealityViewNode.h"
 
 // VR MRMLDM includes
 class vtkVirtualRealityViewInteractorStyleDelegate;
 class vtkVirtualRealityViewInteractorObserver;
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+class vtkVirtualRealityHandMeshVisualization;
+#endif
 
 // VR Widgets includes
 #include "qMRMLVirtualRealityView.h"
@@ -125,6 +134,12 @@ protected:
   void createRenderWindow(vtkMRMLVirtualRealityViewNode::XRBackendType xrBackend);
   void destroyRenderWindow();
 
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+  /// Lazily initialize and update the XR_FB_hand_tracking_mesh based hand
+  /// visualization. Called each render tick before DoOneEvent().
+  void updateHandMeshVisualization();
+#endif
+
   vtkSlicerCamerasModuleLogic* CamerasLogic;
   vtkSmartPointer<vtkSlicerVirtualRealityLogic> VirtualRealityLogic;
 
@@ -151,6 +166,14 @@ protected:
 
   bool IsUpdatingWidgetFromMRML{ false };
   int InitializationAttempts{ 0 };
+
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+  // Hand visualization based on XR_FB_hand_tracking_mesh (OpenXR backend only).
+  // Created on the first render tick after the session is up; left null if the
+  // runtime does not support the extension (InitAttempted avoids retrying).
+  vtkSmartPointer<vtkVirtualRealityHandMeshVisualization> HandMeshVisualization;
+  bool HandMeshVisualizationInitAttempted{ false };
+#endif
 
   // Staging buffers for passthrough volume data captured during rendering.
   // Filled in onRendererEndEvent() (FBO valid), consumed in updatePassthroughVolumeNodes().

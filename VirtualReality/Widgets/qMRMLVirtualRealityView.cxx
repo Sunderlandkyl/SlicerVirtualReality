@@ -43,6 +43,7 @@
 #include "vtkVirtualRealityViewOpenVRInteractorStyle.h"
 #endif
 #if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+#include "vtkVirtualRealityHandMeshVisualization.h"
 #include "vtkVirtualRealityViewOpenXRInteractor.h"
 #include "vtkVirtualRealityViewOpenXRInteractorStyle.h"
 #endif
@@ -513,6 +514,16 @@ void qMRMLVirtualRealityViewPrivate::destroyRenderWindow()
 {
   this->VirtualRealityLoopTimer.stop();
 
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+  // Destroy the hand trackers while the OpenXR session still exists.
+  if (this->HandMeshVisualization != nullptr)
+  {
+    this->HandMeshVisualization->Finalize();
+    this->HandMeshVisualization = nullptr;
+  }
+  this->HandMeshVisualizationInitAttempted = false;
+#endif
+
   // Release OpenGL resources that we own while the render window's
   // GL context is still valid.
   if (this->RenderWindow != nullptr)
@@ -545,6 +556,34 @@ void qMRMLVirtualRealityViewPrivate::destroyRenderWindow()
   this->Lights = nullptr;
   this->RenderWindow = nullptr;
 }
+
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+// --------------------------------------------------------------------------
+void qMRMLVirtualRealityViewPrivate::updateHandMeshVisualization()
+{
+  vtkOpenXRRenderWindow* xrRenderWindow = vtkOpenXRRenderWindow::SafeDownCast(this->RenderWindow);
+  if (xrRenderWindow == nullptr)
+  {
+    return;
+  }
+  if (this->HandMeshVisualization == nullptr)
+  {
+    if (this->HandMeshVisualizationInitAttempted)
+    {
+      // The runtime does not support XR_FB_hand_tracking_mesh
+      return;
+    }
+    this->HandMeshVisualizationInitAttempted = true;
+    vtkNew<vtkVirtualRealityHandMeshVisualization> handMeshVisualization;
+    if (!handMeshVisualization->Initialize(xrRenderWindow, this->Renderer))
+    {
+      return;
+    }
+    this->HandMeshVisualization = handMeshVisualization;
+  }
+  this->HandMeshVisualization->Update();
+}
+#endif
 
 // --------------------------------------------------------------------------
 vtkMRMLVirtualRealityViewNode::XRBackendType qMRMLVirtualRealityViewPrivate::currentXRBackend() const
@@ -881,6 +920,12 @@ void qMRMLVirtualRealityViewPrivate::doOpenVirtualReality()
     // Reset staging flags so onRendererEndEvent() captures fresh data this frame.
     this->ColorStagingHasData = false;
     this->DepthStagingHasData = false;
+
+#if defined(SlicerVirtualReality_HAS_OPENXR_SUPPORT)
+    // Update the skinned hand meshes with the same predicted display time used
+    // for the controller poses, so that hands and controllers stay in sync.
+    this->updateHandMeshVisualization();
+#endif
 
     this->Interactor->DoOneEvent(this->RenderWindow, this->Renderer);
 
