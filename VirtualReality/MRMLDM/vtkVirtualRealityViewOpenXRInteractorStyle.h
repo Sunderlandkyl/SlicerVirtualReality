@@ -127,38 +127,34 @@ public:
   /// to OpenXR "float" actions, so (like LeftGripValueEvent etc. above) they are registered and
   /// bound correctly but never actually invoked (see the \warning above).
   ///
-  /// Only LeftPokePoseEvent/RightPokePoseEvent (fingertip pointing direction) are translated by
-  /// ProcessControllerEvents() into a default behavior: flying, for as long as that hand's poke
-  /// pose is tracked -- no separate click/grasp gesture gates it (unlike
-  /// LeftGripClickEvent/RightGripClickEvent -> PositionProp3DEvent, or the physical controller's
-  /// RightThumbstickEvent/RightThumbstickTouchEvent pair, which need a distinct edge signal to
-  /// start/stop). This works because vtkOpenXRRenderWindowInteractor::HandlePoseAction() invokes
-  /// a pose event unconditionally every frame while (and only while) that pose is actively
-  /// tracked (unlike a boolean action, which only fires on the Press/Release edge, see
-  /// HandleBooleanAction()'s changedSinceLastSync gate) -- so simply reacting to the event's
-  /// presence or absence each frame is enough to know whether to be flying:
-  /// - The first time a given hand's LeftPokePoseEvent/RightPokePoseEvent is seen, an internal
-  ///   LeftFlyActive/RightFlyActive flag is set and StartAction(VTKIS_DOLLY, ...) is called once
-  ///   (idempotently) to enter that VTK interaction state for that hand -- StartAction() only
-  ///   reads the event's device and the explicit state argument, never its Action field, so this
-  ///   is safe despite HandlePoseAction() never setting Action.
-  /// - Every frame thereafter (including that same first frame) that the event fires,
-  ///   ViewerMovement3DEvent is invoked using the poke pose's direction (an extended fingertip
-  ///   "pointing" reference, distinct from the aim pose used for LeftAimPoseEvent/
-  ///   RightAimPoseEvent), driving vtkInteractorStyle3D::Dolly3D() via
-  ///   vtkVRInteractorStyle::Movement3D()'s "already in VTKIS_DOLLY" branch -- mirroring how
-  ///   RightThumbstickEvent's continuous deflection drives repeated Dolly3D() calls above -- and
-  ///   the point-to-fly hand indicator actor is updated to match.
-  /// - There is deliberately no explicit "stop"/EndAction() call: once the event stops arriving
-  ///   (hand no longer tracked/pointing), flying simply stops being driven; InteractionState for
-  ///   that hand is left at VTKIS_DOLLY indefinitely, which is harmless since actual motion only
-  ///   ever happens on frames where this case explicitly invokes ViewerMovement3DEvent.
-  /// Because OpenXR reuses ONE shared per-hand vtkEventDataDevice3D across every action
-  /// dispatched that frame (see vtkOpenXRRenderWindowInteractor::PollXrActions()), and only
-  /// HandleBooleanAction() ever sets that object's Action field, this event could otherwise
-  /// inherit a stale Press/Release value left by an unrelated boolean action for the same hand
-  /// processed earlier in the same frame's dispatch loop -- so this handling never reads
-  /// GetAction() off the event, only WorldPosition/WorldOrientation/WorldDirection.
+  /// Only LeftPokePoseEvent/RightPokePoseEvent are translated by ProcessControllerEvents() into
+  /// a default behavior: point-to-fly. Pointing the index finger in a direction flies in exactly
+  /// that direction (the poke pose is positioned at the index fingertip and oriented along the
+  /// finger), at fixed full speed, with a cone indicator shown at the fingertip while flying.
+  /// Details, in the order they matter:
+  /// - The poke pose (like all hand poses) is tracked whenever the hand is, not only while
+  ///   pointing, and vtkOpenXRRenderWindowInteractor::HandlePoseAction() invokes the pose event
+  ///   unconditionally every frame while tracked -- so the event alone cannot distinguish
+  ///   "pointing" from "hand merely visible". Flying is therefore gated on an "index finger
+  ///   extended" test: the physical-space (meters, magnification-independent) distance between
+  ///   the poke pose (fingertip) and grip pose (palm), with hysteresis, entering/leaving
+  ///   VTKIS_DOLLY via StartAction()/EndAction() on that gate's transitions.
+  /// - The vtkEventDataDevice3D delivered with the event always carries the "handpose" (aim)
+  ///   action's pose, NOT the poke pose (vtkOpenXRRenderWindowInteractor::PollXrActions() builds
+  ///   ONE event object per hand per frame from GetHandPose()), so the true fingertip pose is
+  ///   fetched via vtkVirtualRealityViewOpenXRInteractor::GetActionPoseWorld() instead.
+  /// - While the gate is active, every pose event synthesizes a ViewerMovement3DEvent that
+  ///   behaves exactly like a thumbstick held fully forward: TrackPadPosition set to (0, 1) ON
+  ///   THE EVENT (vtkInteractorStyle3D::Dolly3D() refreshes its speed from the event's trackpad
+  ///   data whenever the event's Type is ViewerMovement3DEvent), WorldOrientation set to the
+  ///   poke pose so Dolly3D() flies along the finger, driving its "already in VTKIS_DOLLY"
+  ///   branch every frame -- mirroring how RightThumbstickEvent's continuous deflection drives
+  ///   repeated Dolly3D() calls above.
+  /// - A fresh event object is synthesized rather than forwarding the shared per-hand one, whose
+  ///   Action field could carry a stale Press/Release left by an unrelated boolean action
+  ///   processed earlier in the same frame's dispatch loop (only
+  ///   vtkOpenXRRenderWindowInteractor::HandleBooleanAction() ever sets it); this handling never
+  ///   reads GetAction() off the incoming pose event.
   ///
   /// LeftPinchClickEvent/RightPinchClickEvent are translated into PositionProp3DEvent (grab/move,
   /// the same way LeftGripClickEvent/RightGripClickEvent are for controllers), since pinch (thumb
@@ -304,27 +300,35 @@ protected:
   static void ProcessControllerEvents(
     vtkObject* object, unsigned long event, void* clientData, void* callData);
 
-  /// Show/hide/recolor the point-to-fly indicator actor for the given hand (creating it first if
-  /// needed -- see UpdateHandIndicatorPose()). Called from ProcessControllerEvents() on every
-  /// LeftPokePoseEvent/RightPokePoseEvent.
+  /// Show/hide the point-to-fly indicator actor for the given hand. The actor must already have
+  /// been created by UpdateHandIndicatorPose() -- a null actor is silently ignored. Called from
+  /// ProcessControllerEvents() on the pointing gate's transitions.
   void SetHandIndicatorActive(bool isLeftHand, bool active);
 
-  /// Update the point-to-fly indicator actor's transform for the given hand from its current poke
-  /// pose (fingertip pointing direction). Called from ProcessControllerEvents() on every
-  /// LeftPokePoseEvent/RightPokePoseEvent (i.e. every frame that hand's poke pose is tracked), so
-  /// the indicator is always correctly positioned/oriented while visible.
-  void UpdateHandIndicatorPose(bool isLeftHand, vtkEventDataDevice3D* edd);
+  /// Update the point-to-fly indicator actor's transform for the given hand (creating the actor
+  /// on first use -- a renderer must be available by then). Called from ProcessControllerEvents()
+  /// with the poke pose (fingertip position, oriented along the finger) every frame that hand is
+  /// flying, so the indicator tracks the fingertip while visible.
+  void UpdateHandIndicatorPose(
+    bool isLeftHand, const double worldPosition[3], const double worldOrientationWXYZ[4]);
 
   vtkSmartPointer<vtkVirtualRealityViewInteractorStyleDelegate> InteractorStyleDelegate;
   vtkSmartPointer<vtkCallbackCommand> ControllerEventCallbackCommand;
 
-  /// Whether VTKIS_DOLLY has already been entered (via StartAction()) for the left/right hand's
-  /// point-to-fly motion, driven by LeftPokePoseEvent/RightPokePoseEvent alone (see the
-  /// LeftPokePoseEvent doc comment above) -- guards StartAction() from being called more than
-  /// once per hand. Once true, stays true for the lifetime of this interactor style (there is no
-  /// corresponding EndAction(), see the doc comment above for why that is harmless).
+  /// Whether the left/right hand's point-to-fly pointing gate (index finger extended, measured
+  /// as fingertip-to-palm distance -- see the LeftPokePoseEvent doc comment above) is currently
+  /// active, i.e. whether that hand is currently in VTKIS_DOLLY and flying.
   bool LeftFlyActive{ false };
   bool RightFlyActive{ false };
+
+  /// Largest fingertip-to-palm physical distance (meters) observed for each hand this session --
+  /// the self-calibrated "extended finger reach" that the pointing gate's start/stop thresholds
+  /// are computed from, so the point-to-fly gesture works for any hand size without hardcoded
+  /// adult-hand distances. Starts at 0 and is raised (never lowered, within an anatomical
+  /// ceiling) by every poke-pose update; see the LeftPokePoseEvent handling in
+  /// ProcessControllerEvents() for the constants.
+  double LeftCalibratedFingerReach{ 0.0 };
+  double RightCalibratedFingerReach{ 0.0 };
 
   /// Small cone actors shown at the poke-pose position/orientation (fingertip pointing direction)
   /// of a hand while that hand's point-to-fly gesture is active, as a visual indicator of both the

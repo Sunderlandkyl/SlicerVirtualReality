@@ -21,8 +21,37 @@
 // VR MRMLDM includes
 #include "vtkVirtualRealityViewOpenXRInteractor.h"
 
+// VTK Rendering/OpenXR includes
+#include <vtkOpenXRManager.h>
+
 // VTK includes
 #include <vtkObjectFactory.h>
 
 //------------------------------------------------------------------------------
 vtkStandardNewMacro(vtkVirtualRealityViewOpenXRInteractor);
+
+//------------------------------------------------------------------------------
+bool vtkVirtualRealityViewOpenXRInteractor::GetActionPoseWorld(const std::string& actionName,
+  uint32_t hand, double worldPosition[3], double worldOrientationWXYZ[4],
+  double physicalPosition[3], double worldDirection[3])
+{
+  if (hand >= vtkOpenXRManager::ControllerIndex::NumberOfControllers)
+  {
+    return false;
+  }
+  ActionData* actionData = this->GetActionDataFromName(actionName);
+  if (!actionData)
+  {
+    return false;
+  }
+  const XrSpaceLocation& location = actionData->ActionStruct.PoseLocations[hand];
+  constexpr XrSpaceLocationFlags requiredFlags =
+    XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+  if ((location.locationFlags & requiredFlags) != requiredFlags)
+  {
+    return false;
+  }
+  this->ConvertOpenXRPoseToWorldCoordinates(
+    location.pose, worldPosition, worldOrientationWXYZ, physicalPosition, worldDirection);
+  return true;
+}

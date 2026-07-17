@@ -19,19 +19,27 @@
 ==============================================================================*/
 
 // VR MRMLDM includes
+#include "vtkVirtualRealityViewOpenXRInteractor.h"
 #include "vtkVirtualRealityViewOpenXRInteractorStyle.h"
 
 // VTK Rendering/OpenXR includes
+#include <vtkOpenXRManager.h>
 #include <vtkOpenXRRenderWindowInteractor.h>
 
 // VTK includes
 #include <vtkActor.h>
 #include <vtkConeSource.h>
+#include <vtkMath.h>
 #include <vtkNew.h>
 #include <vtkObjectFactory.h>
 #include <vtkPolyDataMapper.h>
 #include <vtkProperty.h>
 #include <vtkRenderer.h>
+
+// STD includes
+#include <algorithm>
+#include <cmath>
+#include <iostream>
 
 //----------------------------------------------------------------------------
 vtkStandardNewMacro(vtkVirtualRealityViewOpenXRInteractorStyle);
@@ -209,60 +217,122 @@ void vtkVirtualRealityViewOpenXRInteractorStyle::ProcessControllerEvents(
   case RightPokePoseEvent:
   {
     vtkEventDataDevice3D* edd = static_cast<vtkEventData*>(callData)->GetAsEventDataDevice3D();
-    if (!edd)
+    vtkVirtualRealityViewOpenXRInteractor* xrInteractor =
+      vtkVirtualRealityViewOpenXRInteractor::SafeDownCast(interactor);
+    if (!edd || !xrInteractor)
     {
       break;
     }
     bool isLeftHand = (event == LeftPokePoseEvent);
-    // No separate click/grasp gesture gates flying: LeftPokePoseEvent/RightPokePoseEvent alone
-    // drives it, for as long as that hand's poke pose (fingertip-pointing direction) is tracked.
-    // vtkOpenXRRenderWindowInteractor::HandlePoseAction() only invokes this event at all while
-    // pose.isActive is true (unconditionally every frame in that case, unlike a boolean action),
-    // and never invokes it once inactive -- so there is no separate "stop" event to react to;
-    // flying simply stops being driven the moment this event stops arriving (hand no longer
-    // tracked/pointing).
-    self->UpdateHandIndicatorPose(isLeftHand, edd);
-    self->SetHandIndicatorActive(isLeftHand, true);
+    uint32_t hand =
+      isLeftHand ? vtkOpenXRManager::ControllerIndex::Left : vtkOpenXRManager::ControllerIndex::Right;
 
-    bool& flyStarted = isLeftHand ? self->LeftFlyActive : self->RightFlyActive;
-    if (!flyStarted)
+    // The event's own WorldPosition/WorldOrientation always carry the "handpose" (aim) pose, not
+    // this action's pose (see GetActionPoseWorld()'s doc) -- fetch the actual poke pose (index
+    // fingertip position, oriented along the finger) and grip pose (palm) directly instead.
+    double pokePos[3], pokeWXYZ[4], pokePhysPos[3], pokeDir[3];
+    double gripPos[3], gripWXYZ[4], gripPhysPos[3], gripDir[3];
+    if (!xrInteractor->GetActionPoseWorld(isLeftHand ? "left_poke_pose" : "right_poke_pose", hand,
+          pokePos, pokeWXYZ, pokePhysPos, pokeDir)
+      || !xrInteractor->GetActionPoseWorld(isLeftHand ? "left_grip_pose" : "right_grip_pose", hand,
+          gripPos, gripWXYZ, gripPhysPos, gripDir))
     {
-      // Enter VTKIS_DOLLY once, the first time this hand's poke pose is seen. StartAction()
-      // only reads edd->GetDevice() and the explicit state argument (VTKIS_DOLLY), never
-      // edd->GetAction(), so it is safe to call here even though HandlePoseAction() never sets
-      // that field (see the \warning below on why the per-frame synthetic event further down
-      // still avoids reading it).
-      flyStarted = true;
-      self->StartAction(VTKIS_DOLLY, edd);
+      break;
     }
 
-    // Build a fresh event instead of forwarding edd/callData directly: edd is the ONE shared
-    // per-hand event object that vtkOpenXRRenderWindowInteractor::PollXrActions() mutates for
-    // EVERY action dispatched to this hand this frame, and only HandleBooleanAction() ever
-    // touches its Action field -- so it could be carrying a stale Press/Release value left by
-    // an unrelated boolean action processed earlier in this frame's dispatch loop. A freshly
-    // constructed vtkEventDataDevice3D defaults its Action to vtkEventDataAction::Unknown,
-    // which is neither Press nor Release, so vtkVRInteractorStyle::Movement3D() falls through
-    // to its "already in VTKIS_DOLLY -> call Dolly3D()" branch -- exactly mirroring how a
-    // continuously-deflected thumbstick drives repeated Dolly3D() calls.
-    vtkNew<vtkEventDataDevice3D> flyEvent;
-    flyEvent->SetDevice(edd->GetDevice());
-    flyEvent->SetInput(vtkEventDataDeviceInput::Trigger);
-    flyEvent->SetType(vtkCommand::ViewerMovement3DEvent);
-    flyEvent->SetWorldPosition(edd->GetWorldPosition());
-    flyEvent->SetWorldOrientation(edd->GetWorldOrientation());
-    flyEvent->SetWorldDirection(edd->GetWorldDirection());
+    // The poke pose is tracked whenever the hand is, not only while pointing -- so gate flying
+    // on an "index finger extended" check: physical (meters, magnification-independent) distance
+    // between fingertip (poke) and palm (grip). Absolute thresholds would assume one hand size
+    // (an adult's extended finger reaches ~0.10-0.12 m from the palm, a child's may only reach
+    // ~0.07 m), so the gate self-calibrates instead: the largest fingertip-to-palm distance seen
+    // for this hand during the session is that user's own extended-finger reach, and the
+    // start/stop thresholds are fractions of it. The running maximum starts at a conservative
+    // small-hand value and only grows (clamped to a plausible anatomical ceiling to reject
+    // tracking glitches), so a small hand is flyable immediately and a large hand tightens its
+    // own thresholds the first time its finger is extended. Hysteresis (start fraction > stop
+    // fraction) prevents flicker at the boundary.
+    constexpr double initialFingerReach = 0.07;   // meters; conservative small-hand default
+    constexpr double maximumFingerReach = 0.13;   // meters; anatomical ceiling, rejects glitches
+    constexpr double startPointingFraction = 0.75; // of the calibrated reach
+    constexpr double stopPointingFraction = 0.55;  // of the calibrated reach
+    double fingertipToPalm =
+      std::sqrt(vtkMath::Distance2BetweenPoints(pokePhysPos, gripPhysPos));
 
-    // Fixed-speed forward flight: hand-tracking gestures have no analog throttle equivalent to
-    // the physical thumbstick's deflection amount.
-    //
-    // \warning LastTrackPadPosition and LastDolly3DEventTime (vtkInteractorStyle3D) are shared
-    // across ALL devices, not indexed per hand: if both hands are flying at once, their motion
-    // vector-sums rather than being tracked independently per hand. Accepted as v1 behavior.
-    self->LastTrackPadPosition[0] = 0.0;
-    self->LastTrackPadPosition[1] = 1.0;
+    double& fingerReach =
+      isLeftHand ? self->LeftCalibratedFingerReach : self->RightCalibratedFingerReach;
+    if (fingerReach < initialFingerReach)
+    {
+      fingerReach = initialFingerReach;
+    }
+    fingerReach = std::min(std::max(fingerReach, fingertipToPalm), maximumFingerReach);
 
-    interactor->InvokeEvent(vtkCommand::ViewerMovement3DEvent, flyEvent);
+    const double startPointingDistance = startPointingFraction * fingerReach;
+    const double stopPointingDistance = stopPointingFraction * fingerReach;
+
+    bool& flyActive = isLeftHand ? self->LeftFlyActive : self->RightFlyActive;
+    if (!flyActive && fingertipToPalm > startPointingDistance)
+    {
+      flyActive = true;
+      // Enter VTKIS_DOLLY for this hand. StartAction() only reads edd->GetDevice() and the
+      // explicit state argument, never edd->GetAction(), so it is safe to call with the shared
+      // event object even though HandlePoseAction() never sets its Action field.
+      self->StartAction(VTKIS_DOLLY, edd);
+      // Update the pose first: it lazily creates the indicator actor, which
+      // SetHandIndicatorActive() needs to already exist to make visible.
+      self->UpdateHandIndicatorPose(isLeftHand, pokePos, pokeWXYZ);
+      self->SetHandIndicatorActive(isLeftHand, true);
+      // TEMPORARY DIAGNOSTIC for on-device gesture threshold tuning -- remove once tuned.
+      std::cout << "[point-to-fly] " << (isLeftHand ? "left" : "right")
+                << " start (fingertip-palm " << fingertipToPalm << " m, calibrated reach "
+                << fingerReach << " m, start threshold " << startPointingDistance << " m)"
+                << std::endl;
+    }
+    else if (flyActive && fingertipToPalm < stopPointingDistance)
+    {
+      flyActive = false;
+      self->EndAction(VTKIS_DOLLY, edd);
+      self->SetHandIndicatorActive(isLeftHand, false);
+      // TEMPORARY DIAGNOSTIC for on-device gesture threshold tuning -- remove once tuned.
+      std::cout << "[point-to-fly] " << (isLeftHand ? "left" : "right")
+                << " stop (fingertip-palm " << fingertipToPalm << " m, calibrated reach "
+                << fingerReach << " m, stop threshold " << stopPointingDistance << " m)"
+                << std::endl;
+    }
+
+    if (flyActive)
+    {
+      self->UpdateHandIndicatorPose(isLeftHand, pokePos, pokeWXYZ);
+
+      // Build a fresh event instead of forwarding edd/callData directly: edd is the ONE shared
+      // per-hand event object that vtkOpenXRRenderWindowInteractor::PollXrActions() mutates for
+      // EVERY action dispatched to this hand this frame, and only HandleBooleanAction() ever
+      // touches its Action field -- so it could be carrying a stale Press/Release value left by
+      // an unrelated boolean action processed earlier in this frame's dispatch loop. A freshly
+      // constructed vtkEventDataDevice3D defaults its Action to vtkEventDataAction::Unknown,
+      // which is neither Press nor Release, so vtkVRInteractorStyle::Movement3D() falls through
+      // to its "already in VTKIS_DOLLY -> call Dolly3D()" branch -- exactly mirroring how a
+      // continuously-deflected thumbstick drives repeated Dolly3D() calls.
+      vtkNew<vtkEventDataDevice3D> flyEvent;
+      flyEvent->SetDevice(edd->GetDevice());
+      flyEvent->SetInput(vtkEventDataDeviceInput::Trigger);
+      flyEvent->SetType(vtkCommand::ViewerMovement3DEvent);
+      flyEvent->SetWorldPosition(pokePos);
+      flyEvent->SetWorldOrientation(pokeWXYZ);
+      flyEvent->SetWorldDirection(pokeDir);
+      // Fixed full-speed forward "throttle": since the event's Type is ViewerMovement3DEvent,
+      // vtkInteractorStyle3D::Dolly3D() refreshes its speed (LastTrackPadPosition) FROM THIS
+      // EVENT's TrackPadPosition -- so it must be set here, on the event itself, exactly as a
+      // physical thumbstick held fully forward would report (this was previously set on the
+      // style's own LastTrackPadPosition member, which Dolly3D() immediately overwrote with
+      // this event's default (0,0), making fly speed zero).
+      //
+      // \warning LastTrackPadPosition and LastDolly3DEventTime (vtkInteractorStyle3D) are shared
+      // across ALL devices, not indexed per hand: if both hands are flying at once, their motion
+      // vector-sums rather than being tracked independently per hand. Accepted as v1 behavior.
+      flyEvent->SetTrackPadPosition(0.0, 1.0);
+
+      interactor->InvokeEvent(vtkCommand::ViewerMovement3DEvent, flyEvent);
+    }
     break;
   }
   default:
@@ -324,7 +394,7 @@ void vtkVirtualRealityViewOpenXRInteractorStyle::SetHandIndicatorActive(bool isL
 
 //----------------------------------------------------------------------------
 void vtkVirtualRealityViewOpenXRInteractorStyle::UpdateHandIndicatorPose(
-  bool isLeftHand, vtkEventDataDevice3D* edd)
+  bool isLeftHand, const double worldPosition[3], const double worldOrientationWXYZ[4])
 {
   vtkSmartPointer<vtkActor>& actor = isLeftHand ? this->LeftHandIndicatorActor : this->RightHandIndicatorActor;
   if (!actor)
@@ -354,9 +424,8 @@ void vtkVirtualRealityViewOpenXRInteractorStyle::UpdateHandIndicatorPose(
     actor = newActor;
   }
 
-  const double* wpos = edd->GetWorldPosition();
-  actor->SetPosition(wpos[0], wpos[1], wpos[2]);
-  const double* wori = edd->GetWorldOrientation();
+  actor->SetPosition(worldPosition[0], worldPosition[1], worldPosition[2]);
   actor->SetOrientation(0.0, 0.0, 0.0);
-  actor->RotateWXYZ(wori[0], wori[1], wori[2], wori[3]);
+  actor->RotateWXYZ(worldOrientationWXYZ[0], worldOrientationWXYZ[1], worldOrientationWXYZ[2],
+    worldOrientationWXYZ[3]);
 }

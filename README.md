@@ -165,9 +165,13 @@ pinch to let go.
 
 Move around in space by pointing.
 
-Controls: simply point your index finger in the direction you want to travel -- flying starts
-immediately, no separate trigger gesture needed, for as long as your hand is tracked and pointing.
-A small green cone appears at your fingertip while flying, showing the direction you'll travel.
+Controls: simply extend your index finger and point it in the direction you want to travel --
+flying starts immediately, no separate trigger gesture needed, and continues for as long as you
+keep pointing. Curl your finger back in (relax your hand) to stop. A small green cone appears at
+your fingertip while flying, showing the direction you'll travel.
+
+The direction is fully 3D and follows your finger exactly: to fly backwards, point back toward
+(or past) yourself.
 
 > [!NOTE]
 > - Either hand can be used to fly. Using both hands at once is not recommended: since there is no
