@@ -222,6 +222,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         # Runtime VR handles (only valid while active).
         self._interactor = None
         self._observerTags = []
+        self._physicalToWorldConnected = False
 
         # Chrome (raw VTK props, not MRML). Anchored to physical space via _anchorMatrix,
         # which is kept equal to the VR PhysicalToWorldMatrix we apply.
@@ -236,7 +237,6 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._baseMagnification = DEFAULT_MAGNIFICATION
         self._savedPhysicalToWorld = None     # restored on exit
         self._magnification = DEFAULT_MAGNIFICATION
-        self._turntableAngleRad = 0.0
         self._dataBounds = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         self._dataCenter = [0.0, 0.0, 0.0]
 
@@ -330,11 +330,10 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._baseMagnification = viewNode.GetMagnification() or DEFAULT_MAGNIFICATION
 
         self._magnification = DEFAULT_MAGNIFICATION
-        self._turntableAngleRad = 0.0
         self._recomputeDataBounds()
 
         self._buildChrome(renderer)
-        self._applyWorldTransform()
+        self._applyInitialFraming()
 
         self._installObservers(widget)
         self._rotationTimer.start()
@@ -382,7 +381,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
     def _buildChrome(self, renderer) -> None:
         """Create the room/floor/table/text props (authored in physical meters) and add them
-        to the VR renderer. They are anchored to physical space in _applyWorldTransform()."""
+        to the VR renderer. They are anchored to physical space in _reanchorChrome()."""
         params = self.getParameterNode()
 
         floor = self._discActor(
@@ -415,7 +414,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._chromeProps.append(hint)
 
         for prop in self._chromeProps:
-            prop.SetUserMatrix(self._anchorMatrix)  # shared matrix, updated by _applyWorldTransform
+            prop.SetUserMatrix(self._anchorMatrix)  # shared matrix, updated by _reanchorChrome
             renderer.AddViewProp(prop)
 
         self._updateScaleReadout()
@@ -543,23 +542,71 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         vtk.vtkMatrix4x4.Multiply4x4(wInverse, baseMatrix, result)
         return result
 
-    def _applyWorldTransform(self) -> None:
-        """Recompute and push the VR PhysicalToWorldMatrix, and re-anchor the chrome to it."""
+    def _currentPhysicalToWorld(self):
         widget = self._vrViewWidget()
-        if widget is None or self._basePhysicalToWorld is None:
+        if widget is None:
+            return None
+        matrix = vtk.vtkMatrix4x4()
+        widget.renderWindow().GetPhysicalToWorldMatrix(matrix)
+        return matrix
+
+    def _setPhysicalToWorld(self, matrix) -> None:
+        widget = self._vrViewWidget()
+        if widget is None:
             return
-        matrix = self.computePhysicalToWorld(
-            self._basePhysicalToWorld, self._baseMagnification, self._magnification,
-            self._turntableAngleRad, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
         try:
             widget.renderWindow().SetPhysicalToWorldMatrix(matrix)
         except Exception:  # noqa: BLE001
             logging.warning("VRViewer: unable to set PhysicalToWorldMatrix")
-        # Chrome shares _anchorMatrix as its UserMatrix; keep it equal to the applied matrix.
+        self._reanchorChrome(matrix)
+
+    def _reanchorChrome(self, matrix=None) -> None:
+        """Keep chrome (UserMatrix == _anchorMatrix) equal to the current VR PhysicalToWorld,
+        so the room stays fixed relative to the user no matter what moved the world - our
+        controls OR the built-in complex (A+X) gesture."""
+        if matrix is None:
+            matrix = self._currentPhysicalToWorld()
+        if matrix is None:
+            return
         self._anchorMatrix.DeepCopy(matrix)
         for prop in self._chromeProps:
             prop.Modified()
+
+    def _applyInitialFraming(self) -> None:
+        """Absolute framing used on enter and reset: data centered on the table at scale 1.0,
+        upright per the reference view captured on entry. Also undoes any gesture drift."""
+        if self._basePhysicalToWorld is None:
+            return
+        matrix = self.computePhysicalToWorld(
+            self._basePhysicalToWorld, self._baseMagnification, DEFAULT_MAGNIFICATION,
+            0.0, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
+        self._magnification = DEFAULT_MAGNIFICATION
+        self._setPhysicalToWorld(matrix)
         self._updateScaleReadout()
+
+    def _incrementalWorldTransform(self, worldMatrix) -> None:
+        """Apply a world-space transform to the current framing: newPTW = worldMatrix^-1 . PTW.
+        Composing on the *current* matrix is what lets our controls coexist with the gesture."""
+        current = self._currentPhysicalToWorld()
+        if current is None:
+            return
+        inverse = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Invert(worldMatrix, inverse)
+        newMatrix = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Multiply4x4(inverse, current, newMatrix)
+        self._setPhysicalToWorld(newMatrix)
+
+    def _tableAxle(self, matrix):
+        """(worldUp unit vector, table-center world point) for the given PTW matrix - the
+        vertical axle the turntable spins/scales about, fixed at the room's table location."""
+        up = list(matrix.MultiplyPoint([PHYSICAL_UP[0], PHYSICAL_UP[1], PHYSICAL_UP[2], 0.0]))[:3]
+        norm = vtk.vtkMath.Norm(up)
+        up = [c / norm for c in up] if norm > 1e-9 else [0.0, 0.0, 1.0]
+        axle = list(matrix.MultiplyPoint([TABLE_PHYSICAL[0], TABLE_PHYSICAL[1], TABLE_PHYSICAL[2], 1.0]))[:3]
+        return up, axle
+
+    def _onPhysicalToWorldModified(self, caller=None, event=None) -> None:
+        self._reanchorChrome()
 
     # ------------------------------------------------------------------ data collection
 
@@ -626,8 +673,18 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------ turntable rotation
 
     def rotateTurntable(self, deltaRad) -> None:
-        self._turntableAngleRad += deltaRad
-        self._applyWorldTransform()
+        current = self._currentPhysicalToWorld()
+        if current is None:
+            return
+        up, axle = self._tableAxle(current)
+        t = vtk.vtkTransform()
+        t.PostMultiply()
+        t.Translate(-axle[0], -axle[1], -axle[2])
+        t.RotateWXYZ(vtk.vtkMath.DegreesFromRadians(deltaRad), up[0], up[1], up[2])
+        t.Translate(axle[0], axle[1], axle[2])
+        w = vtk.vtkMatrix4x4()
+        t.GetMatrix(w)
+        self._incrementalWorldTransform(w)
 
     def _onRotationTimer(self) -> None:
         if abs(self._leftStickX) < THUMBSTICK_DEADZONE:
@@ -648,15 +705,35 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return max(MIN_MAGNIFICATION, min(MAX_MAGNIFICATION, value))
 
     def setMagnification(self, value) -> None:
-        self._magnification = max(MIN_MAGNIFICATION, min(MAX_MAGNIFICATION, value))
-        self._applyWorldTransform()
+        """Scale the world about the table axle to the requested magnification (relative to the
+        current tracked value), so it composes with the gesture rather than snapping."""
+        newMag = max(MIN_MAGNIFICATION, min(MAX_MAGNIFICATION, value))
+        current = self._currentPhysicalToWorld()
+        if current is None or self._magnification <= 0:
+            self._magnification = newMag
+            return
+        factor = newMag / self._magnification
+        self._magnification = newMag
+        if abs(factor - 1.0) > 1e-9:
+            up, axle = self._tableAxle(current)
+            t = vtk.vtkTransform()
+            t.PostMultiply()
+            t.Translate(-axle[0], -axle[1], -axle[2])
+            t.Scale(factor, factor, factor)
+            t.Translate(axle[0], axle[1], axle[2])
+            w = vtk.vtkMatrix4x4()
+            t.GetMatrix(w)
+            self._incrementalWorldTransform(w)
+        self._updateScaleReadout()
 
     def stepMagnification(self, direction) -> None:
         stepFactor = self.getParameterNode().magnificationStep
         self.setMagnification(self.steppedMagnification(self._magnification, direction, stepFactor))
 
     def resetMagnification(self) -> None:
-        self.setMagnification(DEFAULT_MAGNIFICATION)
+        """Left-stick click: recenter the data on the table at scale 1.0 (also clears gesture drift)."""
+        self._recomputeDataBounds()
+        self._applyInitialFraming()
 
     # ------------------------------------------------------------------ slices
 
@@ -704,7 +781,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._sceneViewIndex = (self._sceneViewIndex + (1 if direction > 0 else -1)) % count
         logic.RestoreSceneView(self._sceneViewIndex)
         self._recomputeDataBounds()
-        self._applyWorldTransform()
+        self._applyInitialFraming()
 
     # ------------------------------------------------------------------ controller observers
 
@@ -730,12 +807,24 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         add(style.RightThumbstickClickEvent, self._onToggleSlices)
         add(style.LeftThumbstickClickEvent, self._onResetScale)
 
+        # Re-anchor the room whenever the world moves - including via the built-in A+X gesture.
+        widget.connect("physicalToWorldMatrixModified()", self._onPhysicalToWorldModified)
+        self._physicalToWorldConnected = True
+
     def _removeObservers(self) -> None:
         if self._interactor is not None:
             for tag in self._observerTags:
                 self._interactor.RemoveObserver(tag)
         self._observerTags = []
         self._interactor = None
+
+        widget = self._vrViewWidget()
+        if widget is not None and self._physicalToWorldConnected:
+            try:
+                widget.disconnect("physicalToWorldMatrixModified()", self._onPhysicalToWorldModified)
+            except Exception:  # noqa: BLE001
+                pass
+        self._physicalToWorldConnected = False
 
     @staticmethod
     def _isPress(calldata) -> bool:
