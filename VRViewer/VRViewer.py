@@ -33,9 +33,12 @@ class VRViewer(ScriptedLoadableModule):
         self.parent.contributors = ["Kyle Sunderland (PerkLab, Queen's University)"]
         self.parent.helpText = _("""
 A grounded, presentation-oriented virtual reality viewer. Instead of flying through empty space,
-the user stands in a fixed room with a turntable in front of them. Scene data is placed on the
-turntable and rotated with the left thumbstick; world scale, scene-view navigation, and slice
+the user stands in a fixed room with a turntable in front of them. Scene data appears on the
+turntable and is rotated with the left thumbstick; world scale, scene-view navigation, and slice
 visibility are driven by controller buttons.
+
+The viewer never modifies the MRML scene: placement, scale and rotation are applied only to the
+VR view (via its PhysicalToWorldMatrix), so the desktop 3D and slice views are left untouched.
 
 Controller bindings (Oculus Touch):
 - Left thumbstick left/right: rotate the turntable
@@ -60,8 +63,8 @@ class VRViewerParameterNode:
     """User-facing options for the VR Viewer.
 
     rotationSpeedDegPerSec - turntable angular speed at full thumbstick deflection.
-    magnificationStep - multiplicative factor applied to magnification per +/- button press.
-    includeSlices - if true, slice planes rotate/scale together with the data on the turntable.
+    magnificationStep - multiplicative factor applied to world scale per +/- button press.
+    includeSlices - if true, slice planes are shown on entry.
     showRoom - if true, room walls are drawn (the floor and table are always drawn).
     """
 
@@ -108,7 +111,6 @@ class VRViewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.updateGUIFromLogic()
 
     def cleanup(self) -> None:
-        # Leave viewer mode cleanly if the module widget is destroyed while active.
         if self.logic:
             self.logic.exitViewerMode()
         self.removeObservers()
@@ -121,7 +123,6 @@ class VRViewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.setParameterNode(None)
 
     def onSceneStartClose(self, caller, event) -> None:
-        # The turntable/collected nodes are about to disappear; tear down cleanly.
         if self.logic:
             self.logic.exitViewerMode()
         self.setParameterNode(None)
@@ -145,7 +146,6 @@ class VRViewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.addObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self.onParameterNodeModified)
 
     def onParameterNodeModified(self, caller=None, event=None) -> None:
-        # Live-apply option changes while the viewer is active.
         if self.logic:
             self.logic.applyOptions()
 
@@ -189,8 +189,9 @@ ROOM_SIZE_M = (6.0, 3.0, 6.0)   # width (X), height (Y), depth (Z)
 ROOM_CENTER_Y_M = 1.5
 SCALE_TEXT_HEIGHT_M = 0.04
 
-# World/RAS vertical axis the turntable spins about (RAS superior = Z).
-TURNTABLE_AXIS = (0.0, 0.0, 1.0)
+# Physical "up" direction and the physical point the data center is placed at (table top).
+PHYSICAL_UP = (0.0, 1.0, 0.0)
+TABLE_PHYSICAL = (0.0, TABLE_HEIGHT_M + TABLE_TOP_THICKNESS_M, TABLE_FORWARD_M)
 
 MIN_MAGNIFICATION = 0.01
 MAX_MAGNIFICATION = 100.0
@@ -199,13 +200,16 @@ DEFAULT_MAGNIFICATION = 1.0
 THUMBSTICK_DEADZONE = 0.15
 ROTATION_TIMER_INTERVAL_MS = 33  # ~30 Hz turntable update
 
-# Slice nodes shown as planes on the turntable.
 SLICE_NODE_IDS = ["vtkMRMLSliceNodeRed", "vtkMRMLSliceNodeGreen", "vtkMRMLSliceNodeYellow"]
 
 
 class VRViewerLogic(ScriptedLoadableModuleLogic):
-    """All VR Viewer behavior. The pure MRML/geometry helpers work without a headset
-    so they can be exercised by the headless test; the chrome/observer/anchor paths
+    """All VR Viewer behavior.
+
+    The viewer is entirely non-destructive to the MRML scene: placement, scale and turntable
+    rotation are applied ONLY to the VR view, by overriding its PhysicalToWorldMatrix. The
+    desktop 3D and 2D views therefore never move. The math (computePhysicalToWorld and the
+    geometry helpers) is pure and covered by the headless test; the chrome/observer paths
     require an active VR view.
     """
 
@@ -218,24 +222,23 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         # Runtime VR handles (only valid while active).
         self._interactor = None
         self._observerTags = []
-        self._physicalToWorldConnection = None
 
-        # Chrome (raw VTK props, not MRML). Anchored to physical space via _anchorMatrix.
+        # Chrome (raw VTK props, not MRML). Anchored to physical space via _anchorMatrix,
+        # which is kept equal to the VR PhysicalToWorldMatrix we apply.
         self._chromeProps = []
         self._scaleTextActor = None
-        self._anchorMatrix = vtk.vtkMatrix4x4()  # copy of PhysicalToWorld, shared by all chrome props
+        self._anchorMatrix = vtk.vtkMatrix4x4()
 
-        # Turntable (MRML transform in world/RAS) + attached data.
-        self._turntableNode = None
+        # VR framing state. The base matrix/magnification are captured on entry (the reference
+        # view Slicer establishes) and everything is expressed relative to it, so the data keeps
+        # Slicer's upright orientation.
+        self._basePhysicalToWorld = None     # M0 captured at enter
+        self._baseMagnification = DEFAULT_MAGNIFICATION
+        self._savedPhysicalToWorld = None     # restored on exit
+        self._magnification = DEFAULT_MAGNIFICATION
         self._turntableAngleRad = 0.0
         self._dataBounds = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         self._dataCenter = [0.0, 0.0, 0.0]
-        self._turntableAxis = list(TURNTABLE_AXIS)   # world "up", updated from PhysicalToWorld
-        self._tableCenterWorld = [0.0, 0.0, 0.0]     # table-top surface point (world)
-        self._tableTargetWorld = [0.0, 0.0, 0.0]     # where the data center lands: surface + up*halfHeight
-        self._savedParents = {}        # transformableNodeID -> original parent transform node ID (or None)
-        self._savedSliceToRAS = {}     # sliceNodeID -> original SliceToRAS (vtkMatrix4x4)
-        self._savedSliceVisible = {}   # sliceNodeID -> original SliceVisible flag
 
         # Saved VR navigation state, restored on exit.
         self._savedDolly = None
@@ -247,7 +250,6 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._rotationTimer.setInterval(ROTATION_TIMER_INTERVAL_MS)
         self._rotationTimer.timeout.connect(self._onRotationTimer)
 
-        # Scene-view iteration state.
         self._sceneViewIndex = -1
 
     def getParameterNode(self):
@@ -288,7 +290,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------ enter/exit
 
     def enterViewerMode(self) -> None:
-        """Activate VR (if needed), build the room + turntable, and install controls."""
+        """Activate VR (if needed), build the room, and install controls. Never mutates the scene."""
         if self.isActive:
             # Genuinely still running -> nothing to do. Otherwise the state is stale (VR was
             # turned off, or the module was reloaded); clean up so we can re-enter fresh.
@@ -319,23 +321,29 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         except Exception:  # noqa: BLE001
             pass
 
-        # World scale starts at the default.
-        viewNode.SetMagnification(DEFAULT_MAGNIFICATION)
+        # Let the VR view establish its reference-view framing, then capture it as our base.
+        slicer.app.processEvents()
+        self._basePhysicalToWorld = vtk.vtkMatrix4x4()
+        widget.renderWindow().GetPhysicalToWorldMatrix(self._basePhysicalToWorld)
+        self._savedPhysicalToWorld = vtk.vtkMatrix4x4()
+        self._savedPhysicalToWorld.DeepCopy(self._basePhysicalToWorld)
+        self._baseMagnification = viewNode.GetMagnification() or DEFAULT_MAGNIFICATION
 
-        # Build the room and place the data on the turntable.
+        self._magnification = DEFAULT_MAGNIFICATION
+        self._turntableAngleRad = 0.0
+        self._recomputeDataBounds()
+
         self._buildChrome(renderer)
-        self._buildTurntable()
-        self._syncAnchor()  # position chrome + turntable for the current physical-to-world matrix
+        self._applyWorldTransform()
 
-        # Controls.
         self._installObservers(widget)
         self._rotationTimer.start()
 
         self.isActive = True
 
     def exitViewerMode(self) -> None:
-        """Tear everything down. Safe to call when not active and idempotent."""
-        if not self.isActive and not self._chromeProps and self._turntableNode is None:
+        """Tear everything down and restore the VR view. Safe when not active; idempotent."""
+        if not self.isActive and not self._chromeProps and self._basePhysicalToWorld is None:
             return
 
         self._rotationTimer.stop()
@@ -343,9 +351,13 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
         self._removeObservers()
 
-        # Restore VR navigation state.
         widget = self._vrViewWidget()
         if widget is not None:
+            if self._savedPhysicalToWorld is not None:
+                try:
+                    widget.renderWindow().SetPhysicalToWorldMatrix(self._savedPhysicalToWorld)
+                except Exception:  # noqa: BLE001
+                    pass
             if self._savedDolly is not None:
                 widget.setDolly3DEnabled(self._savedDolly)
             if self._savedGrab is not None:
@@ -354,24 +366,23 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._savedGrab = None
 
         self._teardownChrome()
-        self._teardownTurntable()
 
+        self._basePhysicalToWorld = None
+        self._savedPhysicalToWorld = None
         self.isActive = False
 
     # ------------------------------------------------------------------ options
 
     def applyOptions(self) -> None:
-        """Re-read user options that can change live (currently rotation speed only,
-        read on demand). Placeholder for future live-applied settings."""
-        if not self.isActive:
-            return
-        # showRoom / includeSlices changes take effect on next enter; nothing to do live yet.
+        """Re-read options that can change live. Rotation speed / scale step are read on demand;
+        showRoom / includeSlices take effect on the next enter."""
+        return
 
     # ------------------------------------------------------------------ chrome
 
     def _buildChrome(self, renderer) -> None:
-        """Create the room/floor/table/text props (authored in physical meters) and add
-        them to the VR renderer. They are anchored to physical space in _syncAnchor()."""
+        """Create the room/floor/table/text props (authored in physical meters) and add them
+        to the VR renderer. They are anchored to physical space in _applyWorldTransform()."""
         params = self.getParameterNode()
 
         floor = self._discActor(
@@ -397,7 +408,6 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             heightMeters=SCALE_TEXT_HEIGHT_M)
         self._chromeProps.append(self._scaleTextActor)
 
-        # Static binding hints near the table.
         hint = self._textActor(
             position=(0.0, TABLE_HEIGHT_M + 0.14, TABLE_FORWARD_M + TABLE_RADIUS_M),
             heightMeters=SCALE_TEXT_HEIGHT_M * 0.6, color=(0.7, 0.75, 0.8))
@@ -405,7 +415,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._chromeProps.append(hint)
 
         for prop in self._chromeProps:
-            prop.SetUserMatrix(self._anchorMatrix)  # shared matrix, updated in-place by _syncAnchor
+            prop.SetUserMatrix(self._anchorMatrix)  # shared matrix, updated by _applyWorldTransform
             renderer.AddViewProp(prop)
 
         self._updateScaleReadout()
@@ -449,7 +459,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.GetProperty().SetColor(0.12, 0.13, 0.16)
-        actor.GetProperty().FrontfaceCullingOn()   # see the inside of the room
+        actor.GetProperty().FrontfaceCullingOn()
         actor.GetProperty().BackfaceCullingOff()
         actor.GetProperty().SetAmbient(0.4)
         actor.PickableOff()
@@ -465,8 +475,6 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         tprop.SetColor(*color)
         tprop.SetJustificationToCentered()
         tprop.SetVerticalJustificationToBottom()
-        # vtkTextActor3D renders text at font-size units; scale it down to the requested
-        # physical height (approx: fontSize px -> heightMeters).
         scale = heightMeters / 48.0
         actor.SetScale(scale, scale, scale)
         actor.SetPosition(position[0], position[1], position[2])
@@ -476,74 +484,89 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     def _updateScaleReadout(self) -> None:
         if self._scaleTextActor is not None:
             self._scaleTextActor.SetInput(
-                _("Scale: {scale:.2f}x").format(scale=self.getMagnification()))
+                _("Scale: {scale:.2f}x").format(scale=self._magnification))
 
-    # ------------------------------------------------------------------ anchor sync
+    # ------------------------------------------------------------------ VR world transform
 
-    def _syncAnchor(self, caller=None, event=None) -> None:
-        """Keep chrome fixed in physical space and data centered over the table as the
-        physical-to-world matrix changes (magnification or user recenter)."""
+    @staticmethod
+    def _extentAlongAxis(bounds, axis):
+        """Extent (max-min projection) of an RAS AABB onto an axis. 0 for empty bounds."""
+        if bounds[0] > bounds[1]:
+            return 0.0
+        projections = []
+        for xi in (bounds[0], bounds[1]):
+            for yi in (bounds[2], bounds[3]):
+                for zi in (bounds[4], bounds[5]):
+                    projections.append(xi * axis[0] + yi * axis[1] + zi * axis[2])
+        return max(projections) - min(projections)
+
+    @staticmethod
+    def computePhysicalToWorld(baseMatrix, baseMagnification, magnification, angleRad,
+                               dataBounds, dataCenter, tablePhysical):
+        """Pure helper (headless-testable). Build the VR PhysicalToWorldMatrix that makes the
+        data appear placed on the table, scaled to `magnification`, and spun by `angleRad`,
+        while keeping the reference-view orientation in `baseMatrix` (M0).
+
+        We want the data to look transformed by a world-space transform W about its center:
+            W = T(target) . R(worldUp, angle) . S(relScale) . T(-dataCenter)
+        Viewing world W.X with the original camera is equivalent to setting
+            M = W^-1 . M0
+        (because view = E^-1 . M^-1, so E^-1 . M^-1 . X == E^-1 . M0^-1 . W . X).
+        A point fixed in physical space then appears at E^-1 . p regardless of M, so the room
+        chrome (anchored with UserMatrix = M) stays put while the data moves.
+        """
+        relScale = (magnification / baseMagnification) if baseMagnification else 1.0
+
+        # World "up" and the world point at the table location, both derived from M0.
+        up = list(baseMatrix.MultiplyPoint([PHYSICAL_UP[0], PHYSICAL_UP[1], PHYSICAL_UP[2], 0.0]))[:3]
+        norm = vtk.vtkMath.Norm(up)
+        up = [c / norm for c in up] if norm > 1e-9 else [0.0, 0.0, 1.0]
+        tableWorld = list(baseMatrix.MultiplyPoint(
+            [tablePhysical[0], tablePhysical[1], tablePhysical[2], 1.0]))[:3]
+
+        # Rest the data's bottom on the table: lift the center by half the (scaled) height.
+        halfHeight = 0.5 * VRViewerLogic._extentAlongAxis(dataBounds, up) * relScale
+        target = [tableWorld[i] + up[i] * halfHeight for i in range(3)]
+
+        w = vtk.vtkTransform()
+        w.PostMultiply()
+        w.Translate(-dataCenter[0], -dataCenter[1], -dataCenter[2])
+        w.Scale(relScale, relScale, relScale)
+        w.RotateWXYZ(vtk.vtkMath.DegreesFromRadians(angleRad), up[0], up[1], up[2])
+        w.Translate(target[0], target[1], target[2])
+        wMatrix = vtk.vtkMatrix4x4()
+        w.GetMatrix(wMatrix)
+
+        wInverse = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Invert(wMatrix, wInverse)
+        result = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Multiply4x4(wInverse, baseMatrix, result)
+        return result
+
+    def _applyWorldTransform(self) -> None:
+        """Recompute and push the VR PhysicalToWorldMatrix, and re-anchor the chrome to it."""
         widget = self._vrViewWidget()
-        if widget is None:
+        if widget is None or self._basePhysicalToWorld is None:
             return
-        physicalToWorld = vtk.vtkMatrix4x4()
-        widget.renderWindow().GetPhysicalToWorldMatrix(physicalToWorld)
-
-        # Chrome: UserMatrix = PhysicalToWorld (its 1/magnification scale cancels the
-        # camera magnification -> the room stays a fixed real-world size and place).
-        self._anchorMatrix.DeepCopy(physicalToWorld)
+        matrix = self.computePhysicalToWorld(
+            self._basePhysicalToWorld, self._baseMagnification, self._magnification,
+            self._turntableAngleRad, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
+        try:
+            widget.renderWindow().SetPhysicalToWorldMatrix(matrix)
+        except Exception:  # noqa: BLE001
+            logging.warning("VRViewer: unable to set PhysicalToWorldMatrix")
+        # Chrome shares _anchorMatrix as its UserMatrix; keep it equal to the applied matrix.
+        self._anchorMatrix.DeepCopy(matrix)
         for prop in self._chromeProps:
             prop.Modified()
+        self._updateScaleReadout()
 
-        # World "up" = physical +Y mapped into world (as a direction, w=0), normalized.
-        # We spin the turntable about this and rest the data on the table along it, so the
-        # data neither wobbles nor sinks regardless of the reference view's orientation.
-        up = list(physicalToWorld.MultiplyPoint([0.0, 1.0, 0.0, 0.0]))[:3]
-        norm = vtk.vtkMath.Norm(up)
-        self._turntableAxis = [c / norm for c in up] if norm > 1e-9 else list(TURNTABLE_AXIS)
+    # ------------------------------------------------------------------ data collection
 
-        # Table-top surface point in world, and the target the data center maps to: lifted
-        # up by half the data's extent along "up" so the data's bottom rests on the surface.
-        self._tableCenterWorld = list(
-            physicalToWorld.MultiplyPoint(
-                [0.0, TABLE_HEIGHT_M + TABLE_TOP_THICKNESS_M, TABLE_FORWARD_M, 1.0]))[:3]
-        halfHeight = 0.5 * self._extentAlongAxis(self._dataBounds, self._turntableAxis)
-        self._tableTargetWorld = [self._tableCenterWorld[i] + self._turntableAxis[i] * halfHeight
-                                  for i in range(3)]
-        self._updateTurntableTransform()
-
-    # ------------------------------------------------------------------ turntable
-
-    def _buildTurntable(self) -> None:
-        self._turntableAngleRad = 0.0
-        self._turntableNode = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLTransformNode", slicer.mrmlScene.GenerateUniqueName("VR Turntable"))
-        self._turntableNode.SetHideFromEditors(True)
-        self._collectAndAttach()
-
-    def _teardownTurntable(self) -> None:
-        self._detachAll()
-        if self._turntableNode is not None and slicer.mrmlScene.IsNodePresent(self._turntableNode):
-            slicer.mrmlScene.RemoveNode(self._turntableNode)
-        self._turntableNode = None
-        self._turntableAngleRad = 0.0
-
-    def _collectAndAttach(self) -> None:
-        """(Re)collect visible data + slices and attach them to the turntable, centered
-        on the table. Used on enter and after each scene-view restore."""
-        self._detachAll()
-        if self._turntableNode is None:
-            return
-
+    def _recomputeDataBounds(self) -> None:
         dataNodes = self._collectVisibleDataNodes()
         self._dataBounds = self._combinedRASBounds(dataNodes)
         self._dataCenter = self._combinedRASCenter(dataNodes)
-        self._attachDataNodes(dataNodes)
-
-        if self.getParameterNode().includeSlices:
-            self._attachSlices()
-
-        self._updateTurntableTransform()
 
     @staticmethod
     def _collectVisibleDataNodes():
@@ -563,7 +586,6 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
                     continue
                 nodes.append(node)
 
-        # Volumes are "on the table" only if they have a visible volume-rendering display.
         volumes = scene.GetNodesByClass("vtkMRMLVolumeNode")
         volumes.UnRegister(None)
         for i in range(volumes.GetNumberOfItems()):
@@ -601,110 +623,11 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         b = VRViewerLogic._combinedRASBounds(nodes)
         return [(b[0] + b[1]) / 2.0, (b[2] + b[3]) / 2.0, (b[4] + b[5]) / 2.0]
 
-    def _attachDataNodes(self, nodes) -> None:
-        """Insert the turntable above the existing transform chains of the collected nodes,
-        recording originals for exact restore. Nodes with no transform are parented directly;
-        nodes with a transform have the top of their chain reparented under the turntable."""
-        turntableId = self._turntableNode.GetID()
-        topTransforms = set()
-        for node in nodes:
-            if not node.IsA("vtkMRMLTransformableNode"):
-                continue
-            parent = node.GetParentTransformNode()
-            if parent is None:
-                if node.GetID() not in self._savedParents:
-                    self._savedParents[node.GetID()] = None
-                node.SetAndObserveTransformNodeID(turntableId)
-            else:
-                top = parent
-                while top.GetParentTransformNode() is not None:
-                    top = top.GetParentTransformNode()
-                if top.GetID() != turntableId:
-                    topTransforms.add(top)
-
-        for top in topTransforms:
-            if top.GetID() not in self._savedParents:
-                self._savedParents[top.GetID()] = None  # top-of-chain had no parent
-            top.SetAndObserveTransformNodeID(turntableId)
-
-    def _attachSlices(self) -> None:
-        """Slice nodes are not transformable, so we rotate them by composing the turntable
-        matrix onto their SliceToRAS directly (recorded for restore)."""
-        for sliceId in SLICE_NODE_IDS:
-            sliceNode = slicer.mrmlScene.GetNodeByID(sliceId)
-            if sliceNode is None:
-                continue
-            original = vtk.vtkMatrix4x4()
-            original.DeepCopy(sliceNode.GetSliceToRAS())
-            self._savedSliceToRAS[sliceId] = original
-            self._savedSliceVisible[sliceId] = sliceNode.GetSliceVisible()
-
-    def _detachAll(self) -> None:
-        # Restore data-node parents.
-        for nodeId, originalParentId in self._savedParents.items():
-            node = slicer.mrmlScene.GetNodeByID(nodeId)
-            if node is not None and node.IsA("vtkMRMLTransformableNode"):
-                node.SetAndObserveTransformNodeID(originalParentId)
-        self._savedParents = {}
-
-        # Restore slice orientations/visibility.
-        for sliceId, original in self._savedSliceToRAS.items():
-            sliceNode = slicer.mrmlScene.GetNodeByID(sliceId)
-            if sliceNode is not None:
-                sliceNode.GetSliceToRAS().DeepCopy(original)
-                sliceNode.UpdateMatrices()
-        for sliceId, visible in self._savedSliceVisible.items():
-            sliceNode = slicer.mrmlScene.GetNodeByID(sliceId)
-            if sliceNode is not None:
-                sliceNode.SetSliceVisible(visible)
-        self._savedSliceToRAS = {}
-        self._savedSliceVisible = {}
-
-    @staticmethod
-    def buildTurntableMatrix(angleRad, axis, anchor, target):
-        """Pure helper (headless-testable): map `anchor` -> `target` while rotating about
-        `axis` through that point (world/RAS coordinates)."""
-        transform = vtk.vtkTransform()
-        transform.PostMultiply()
-        transform.Translate(-anchor[0], -anchor[1], -anchor[2])
-        transform.RotateWXYZ(vtk.vtkMath.DegreesFromRadians(angleRad), axis[0], axis[1], axis[2])
-        transform.Translate(target[0], target[1], target[2])
-        matrix = vtk.vtkMatrix4x4()
-        transform.GetMatrix(matrix)
-        return matrix
-
-    @staticmethod
-    def _extentAlongAxis(bounds, axis):
-        """Extent (max-min projection) of an RAS AABB onto a unit axis. 0 for empty bounds."""
-        if bounds[0] > bounds[1]:
-            return 0.0
-        projections = []
-        for xi in (bounds[0], bounds[1]):
-            for yi in (bounds[2], bounds[3]):
-                for zi in (bounds[4], bounds[5]):
-                    projections.append(xi * axis[0] + yi * axis[1] + zi * axis[2])
-        return max(projections) - min(projections)
-
-    def _updateTurntableTransform(self) -> None:
-        if self._turntableNode is None:
-            return
-        matrix = self.buildTurntableMatrix(
-            self._turntableAngleRad, self._turntableAxis, self._dataCenter, self._tableTargetWorld)
-        self._turntableNode.SetMatrixTransformToParent(matrix)
-
-        # Slices are composed directly (they cannot be parented to a transform node).
-        for sliceId, original in self._savedSliceToRAS.items():
-            sliceNode = slicer.mrmlScene.GetNodeByID(sliceId)
-            if sliceNode is None:
-                continue
-            composed = vtk.vtkMatrix4x4()
-            vtk.vtkMatrix4x4.Multiply4x4(matrix, original, composed)
-            sliceNode.GetSliceToRAS().DeepCopy(composed)
-            sliceNode.UpdateMatrices()
+    # ------------------------------------------------------------------ turntable rotation
 
     def rotateTurntable(self, deltaRad) -> None:
         self._turntableAngleRad += deltaRad
-        self._updateTurntableTransform()
+        self._applyWorldTransform()
 
     def _onRotationTimer(self) -> None:
         if abs(self._leftStickX) < THUMBSTICK_DEADZONE:
@@ -716,15 +639,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------ magnification
 
     def getMagnification(self) -> float:
-        viewNode = self._vrViewNode()
-        return viewNode.GetMagnification() if viewNode else DEFAULT_MAGNIFICATION
-
-    def setMagnification(self, value) -> None:
-        value = max(MIN_MAGNIFICATION, min(MAX_MAGNIFICATION, value))
-        viewNode = self._vrViewNode()
-        if viewNode:
-            viewNode.SetMagnification(value)
-        self._updateScaleReadout()
+        return self._magnification
 
     @staticmethod
     def steppedMagnification(current, direction, stepFactor):
@@ -732,9 +647,13 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         value = current * stepFactor if direction > 0 else current / stepFactor
         return max(MIN_MAGNIFICATION, min(MAX_MAGNIFICATION, value))
 
+    def setMagnification(self, value) -> None:
+        self._magnification = max(MIN_MAGNIFICATION, min(MAX_MAGNIFICATION, value))
+        self._applyWorldTransform()
+
     def stepMagnification(self, direction) -> None:
         stepFactor = self.getParameterNode().magnificationStep
-        self.setMagnification(self.steppedMagnification(self.getMagnification(), direction, stepFactor))
+        self.setMagnification(self.steppedMagnification(self._magnification, direction, stepFactor))
 
     def resetMagnification(self) -> None:
         self.setMagnification(DEFAULT_MAGNIFICATION)
@@ -742,7 +661,9 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------ slices
 
     def toggleSlices(self) -> None:
-        """Toggle 3D visibility of all slice planes together."""
+        """Toggle 3D visibility of all slice planes together. Visibility is global (also
+        affects the desktop 3D view); the slice planes ride the VR world transform, so they
+        rotate/scale with the data in VR without any change to their SliceToRAS."""
         anyVisible = False
         sliceNodes = []
         for sliceId in SLICE_NODE_IDS:
@@ -755,15 +676,6 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         newVisible = not anyVisible
         for sliceNode in sliceNodes:
             sliceNode.SetSliceVisible(newVisible)
-        # A newly shown slice must pick up the current turntable orientation.
-        if newVisible and self.getParameterNode().includeSlices:
-            for sliceNode in sliceNodes:
-                if sliceNode.GetID() not in self._savedSliceToRAS:
-                    original = vtk.vtkMatrix4x4()
-                    original.DeepCopy(sliceNode.GetSliceToRAS())
-                    self._savedSliceToRAS[sliceNode.GetID()] = original
-                    self._savedSliceVisible.setdefault(sliceNode.GetID(), 0)
-            self._updateTurntableTransform()
 
     # ------------------------------------------------------------------ scene views
 
@@ -781,8 +693,8 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return logic.GetNumberOfSceneViews() if logic else 0
 
     def cycleSceneView(self, direction) -> None:
-        """Restore the next/previous scene view, then re-attach data to the turntable
-        (restore reverts MRML, dropping our transform/parenting)."""
+        """Restore the next/previous scene view, then re-apply the VR framing (the data set may
+        have changed, but the scene itself is otherwise left as the scene view defines it)."""
         logic = self._sceneViewsLogic()
         if logic is None:
             return
@@ -791,16 +703,8 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             return
         self._sceneViewIndex = (self._sceneViewIndex + (1 if direction > 0 else -1)) % count
         logic.RestoreSceneView(self._sceneViewIndex)
-
-        # The turntable node may have been removed by RestoreScene; recreate if needed.
-        if self._turntableNode is None or not slicer.mrmlScene.IsNodePresent(self._turntableNode):
-            self._turntableNode = slicer.mrmlScene.AddNewNodeByClass(
-                "vtkMRMLTransformNode", slicer.mrmlScene.GenerateUniqueName("VR Turntable"))
-            self._turntableNode.SetHideFromEditors(True)
-        self._savedParents = {}
-        self._savedSliceToRAS = {}
-        self._savedSliceVisible = {}
-        self._collectAndAttach()
+        self._recomputeDataBounds()
+        self._applyWorldTransform()
 
     # ------------------------------------------------------------------ controller observers
 
@@ -816,8 +720,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         highPriority = 100.0
 
         def add(eventId, callback):
-            tag = interactor.AddObserver(eventId, callback, highPriority)
-            self._observerTags.append(tag)
+            self._observerTags.append(interactor.AddObserver(eventId, callback, highPriority))
 
         add(style.LeftThumbstickEvent, self._onLeftThumbstick)
         add(style.RightButton2ClickEvent, self._onScaleUp)     # B
@@ -827,23 +730,12 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         add(style.RightThumbstickClickEvent, self._onToggleSlices)
         add(style.LeftThumbstickClickEvent, self._onResetScale)
 
-        self._physicalToWorldConnection = widget.connect(
-            "physicalToWorldMatrixModified()", self._syncAnchor)
-
     def _removeObservers(self) -> None:
         if self._interactor is not None:
             for tag in self._observerTags:
                 self._interactor.RemoveObserver(tag)
         self._observerTags = []
         self._interactor = None
-
-        widget = self._vrViewWidget()
-        if widget is not None and self._physicalToWorldConnection is not None:
-            try:
-                widget.disconnect("physicalToWorldMatrixModified()", self._syncAnchor)
-            except Exception:  # noqa: BLE001
-                pass
-        self._physicalToWorldConnection = None
 
     @staticmethod
     def _isPress(calldata) -> bool:
@@ -897,9 +789,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
 
 class VRViewerTest(ScriptedLoadableModuleTest):
-    """Runtime self-test. The headless logic assertions live in
-    Testing/Python/VRViewerLogicTest.py; this mirrors the key ones so they can be run
-    from the Reload & Test panel without a headset."""
+    """Runtime self-test mirroring the headless logic assertions (no headset needed)."""
 
     def setUp(self):
         slicer.mrmlScene.Clear()
@@ -919,14 +809,14 @@ class VRViewerTest(ScriptedLoadableModuleTest):
         self.assertEqual(logic.steppedMagnification(MAX_MAGNIFICATION, +1, 2.0), MAX_MAGNIFICATION)
         self.assertEqual(logic.steppedMagnification(MIN_MAGNIFICATION, -1, 2.0), MIN_MAGNIFICATION)
 
-        # Turntable matrix maps the anchor onto the target, at any rotation.
-        axis = [0.0, 0.0, 1.0]
-        anchor = [10.0, 20.0, 30.0]
-        target = [100.0, 200.0, 300.0]
-        for angleDeg in (0.0, 90.0):
-            matrix = logic.buildTurntableMatrix(vtk.vtkMath.RadiansFromDegrees(angleDeg), axis, anchor, target)
-            mapped = matrix.MultiplyPoint([anchor[0], anchor[1], anchor[2], 1.0])
-            for a in range(3):
-                self.assertAlmostEqual(mapped[a], target[a], places=4)
+        # With M0 = identity and matching magnifications, the data center appears at the table
+        # location: M maps the table physical point onto the data center (zero-extent data).
+        identity = vtk.vtkMatrix4x4()
+        dataCenter = [10.0, 20.0, 30.0]
+        emptyBounds = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]  # extent 0
+        m = logic.computePhysicalToWorld(identity, 1.0, 1.0, 0.0, emptyBounds, dataCenter, TABLE_PHYSICAL)
+        mapped = m.MultiplyPoint([TABLE_PHYSICAL[0], TABLE_PHYSICAL[1], TABLE_PHYSICAL[2], 1.0])
+        for a in range(3):
+            self.assertAlmostEqual(mapped[a], dataCenter[a], places=4)
 
         self.delayDisplay("Test passed")
