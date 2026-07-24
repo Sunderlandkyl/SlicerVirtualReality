@@ -204,6 +204,9 @@ TABLE_PHYSICAL = (0.0, TABLE_HEIGHT_M + TABLE_TOP_THICKNESS_M, TABLE_FORWARD_M)
 MIN_MAGNIFICATION = 0.01
 MAX_MAGNIFICATION = 100.0
 DEFAULT_MAGNIFICATION = 1.0
+# PhysicalToWorld column length (world mm per physical m) at magnification 1.0 (real-world size).
+# SlicerVR convention: magnification = 1000 / physicalScale.
+UNIT_MAGNIFICATION_SCALE = 1000.0
 
 THUMBSTICK_DEADZONE = 0.15
 INPUT_TIMER_INTERVAL_MS = 33  # ~30 Hz continuous-input update (turntable + slice scroll)
@@ -514,7 +517,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     def _updateScaleReadout(self) -> None:
         # Derive the displayed scale from the actual matrix so it reflects any source of change,
         # including the built-in A+X gesture - not just our +/- steps.
-        self._magnification = self._currentScale()
+        self._magnification = self._currentMagnification()
         if self._scaleTextActor is not None:
             self._scaleTextActor.SetInput(
                 _("Scale: {scale:.2f}x").format(scale=self._magnification))
@@ -634,7 +637,10 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         """Recompute the data bounds and reframe (used on enter, reset, and after a scene-view
         change). Fit-to-table is opt-in; otherwise the framing scale is a constant 1.0."""
         self._recomputeDataBounds()
-        self._fitRelScale = self._computeFitRelScale() if self.getParameterNode().fitToTable else 1.0
+        if self.getParameterNode().fitToTable:
+            self._fitRelScale = self._computeFitRelScale()
+        else:
+            self._fitRelScale = self._framingRelScale(DEFAULT_MAGNIFICATION)  # true life size
         self._applyFraming()
 
     def _incrementalWorldTransform(self, worldMatrix) -> None:
@@ -664,16 +670,22 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return (matrix.GetElement(0, 0) ** 2 + matrix.GetElement(1, 0) ** 2
                 + matrix.GetElement(2, 0) ** 2) ** 0.5
 
-    def _currentScale(self) -> float:
-        """Apparent data scale relative to the reference view (1.0 = normal VR size). Derived
-        from the live matrices, so it reflects our controls AND the complex gesture."""
+    def _currentMagnification(self) -> float:
+        """True world magnification: 1.0 = real-world size, matching SlicerVR's convention
+        (magnification = 1000 / PhysicalToWorld scale). Derived from the live matrix, so it
+        reflects our controls AND the complex gesture."""
         current = self._currentPhysicalToWorld()
-        if current is None or self._basePhysicalToWorld is None:
+        if current is None:
             return self._magnification
-        sCur = self._linearScale(current)
-        if sCur < 1e-12:
-            return self._magnification
-        return self._linearScale(self._basePhysicalToWorld) / sCur
+        scale = self._linearScale(current)
+        return (UNIT_MAGNIFICATION_SCALE / scale) if scale > 1e-9 else self._magnification
+
+    def _framingRelScale(self, magnification):
+        """World relScale (relative to the reference view M0) that yields the given real-world
+        magnification, so a non-fit framing at magnification 1.0 is true life size."""
+        if self._basePhysicalToWorld is None:
+            return 1.0
+        return self._linearScale(self._basePhysicalToWorld) * magnification / UNIT_MAGNIFICATION_SCALE
 
     def _onPhysicalToWorldModified(self, caller=None, event=None) -> None:
         self._reanchorChrome()
@@ -795,7 +807,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------ magnification
 
     def getMagnification(self) -> float:
-        return self._currentScale()
+        return self._currentMagnification()
 
     @staticmethod
     def steppedMagnification(current, direction, stepFactor):
@@ -810,7 +822,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         if current is None:
             self._magnification = value
             return
-        currentScale = self._currentScale()
+        currentScale = self._currentMagnification()
         newScale = max(MIN_MAGNIFICATION, min(MAX_MAGNIFICATION, value))
         if currentScale <= 0:
             return
@@ -829,7 +841,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
     def stepMagnification(self, direction) -> None:
         stepFactor = self.getParameterNode().magnificationStep
-        self.setMagnification(self.steppedMagnification(self._currentScale(), direction, stepFactor))
+        self.setMagnification(self.steppedMagnification(self._currentMagnification(), direction, stepFactor))
 
     def resetMagnification(self) -> None:
         """Left-stick click: recenter the data on the table at scale 1.0, rotation zeroed
