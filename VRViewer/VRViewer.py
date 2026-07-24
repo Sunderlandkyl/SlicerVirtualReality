@@ -593,6 +593,12 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         except Exception:  # noqa: BLE001
             logging.warning("VRViewer: unable to set PhysicalToWorldMatrix")
         self._reanchorChrome(matrix)
+        # Changing the physical scale invalidates the camera near/far planes (they are scaled by
+        # physicalScale), so recompute them - the same thing SlicerVR's delegate does after a
+        # grab/gesture/magnification change. Without this, data is clipped when the scale changes.
+        renderer = self._vrRenderer()
+        if renderer is not None:
+            renderer.ResetCameraClippingRange()
 
     def _reanchorChrome(self, matrix=None) -> None:
         """Keep chrome (UserMatrix == _anchorMatrix) equal to the current VR PhysicalToWorld,
