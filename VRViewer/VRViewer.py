@@ -42,10 +42,14 @@ VR view (via its PhysicalToWorldMatrix), so the desktop 3D and slice views are l
 
 Controller bindings (Oculus Touch):
 - Left thumbstick left/right: rotate the turntable
+- Right thumbstick up/down: scroll the active slice
 - B button: increase scale, Y button: decrease scale
 - Right/Left trigger: next/previous scene view
 - Right thumbstick click: toggle slice visibility
-- Left thumbstick click: reset scale to 1.0
+- Right grip: change which slice is active (Red/Green/Yellow)
+- Left thumbstick click: refit the data on the table (scale 1.0)
+- Left menu button: toggle hands-free auto-spin
+- Two-controller A+X gesture: freely move/scale/rotate (the room follows)
 """)
         self.parent.helpText += self.getDefaultModuleDocumentationLink()
         self.parent.acknowledgementText = _("""
@@ -198,7 +202,9 @@ MAX_MAGNIFICATION = 100.0
 DEFAULT_MAGNIFICATION = 1.0
 
 THUMBSTICK_DEADZONE = 0.15
-ROTATION_TIMER_INTERVAL_MS = 33  # ~30 Hz turntable update
+INPUT_TIMER_INTERVAL_MS = 33  # ~30 Hz continuous-input update (turntable + slice scroll)
+SLICE_SCROLL_MM_PER_SEC = 60.0  # active-slice scroll speed at full right-stick deflection
+AUTO_SPIN_DEG_PER_SEC = 12.0    # hands-free presentation rotation speed
 
 SLICE_NODE_IDS = ["vtkMRMLSliceNodeRed", "vtkMRMLSliceNodeGreen", "vtkMRMLSliceNodeYellow"]
 
@@ -230,13 +236,13 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._scaleTextActor = None
         self._anchorMatrix = vtk.vtkMatrix4x4()
 
-        # VR framing state. The base matrix/magnification are captured on entry (the reference
-        # view Slicer establishes) and everything is expressed relative to it, so the data keeps
-        # Slicer's upright orientation.
+        # VR framing state. The base matrix is captured on entry (the reference view Slicer
+        # establishes) and everything is expressed relative to it, so the data keeps Slicer's
+        # upright orientation.
         self._basePhysicalToWorld = None     # M0 captured at enter
-        self._baseMagnification = DEFAULT_MAGNIFICATION
         self._savedPhysicalToWorld = None     # restored on exit
-        self._magnification = DEFAULT_MAGNIFICATION
+        self._magnification = DEFAULT_MAGNIFICATION   # user-facing scale (1.0 = fitted to table)
+        self._fitRelScale = 1.0                        # world scale that fits data to the table
         self._dataBounds = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         self._dataCenter = [0.0, 0.0, 0.0]
 
@@ -244,11 +250,14 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._savedDolly = None
         self._savedGrab = None
 
-        # Turntable rotation driven by a timer from the current stick deflection.
+        # Continuous inputs (applied on a timer): left-stick rotate, right-stick slice scroll.
         self._leftStickX = 0.0
-        self._rotationTimer = qt.QTimer()
-        self._rotationTimer.setInterval(ROTATION_TIMER_INTERVAL_MS)
-        self._rotationTimer.timeout.connect(self._onRotationTimer)
+        self._rightStickY = 0.0
+        self._autoSpin = False
+        self._activeSliceIndex = 0
+        self._inputTimer = qt.QTimer()
+        self._inputTimer.setInterval(INPUT_TIMER_INTERVAL_MS)
+        self._inputTimer.timeout.connect(self._onInputTimer)
 
         self._sceneViewIndex = -1
 
@@ -327,16 +336,25 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         widget.renderWindow().GetPhysicalToWorldMatrix(self._basePhysicalToWorld)
         self._savedPhysicalToWorld = vtk.vtkMatrix4x4()
         self._savedPhysicalToWorld.DeepCopy(self._basePhysicalToWorld)
-        self._baseMagnification = viewNode.GetMagnification() or DEFAULT_MAGNIFICATION
 
         self._magnification = DEFAULT_MAGNIFICATION
-        self._recomputeDataBounds()
+        self._activeSliceIndex = 0
+        self._autoSpin = False
+        self._leftStickX = 0.0
+        self._rightStickY = 0.0
 
         self._buildChrome(renderer)
-        self._applyInitialFraming()
+        self._resetFraming()
+
+        # Show/hide the slice planes on entry per the option.
+        slicesVisible = self.getParameterNode().includeSlices
+        for sliceId in SLICE_NODE_IDS:
+            sliceNode = slicer.mrmlScene.GetNodeByID(sliceId)
+            if sliceNode is not None:
+                sliceNode.SetSliceVisible(slicesVisible)
 
         self._installObservers(widget)
-        self._rotationTimer.start()
+        self._inputTimer.start()
 
         self.isActive = True
 
@@ -345,7 +363,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         if not self.isActive and not self._chromeProps and self._basePhysicalToWorld is None:
             return
 
-        self._rotationTimer.stop()
+        self._inputTimer.stop()
         self._leftStickX = 0.0
 
         self._removeObservers()
@@ -410,7 +428,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         hint = self._textActor(
             position=(0.0, TABLE_HEIGHT_M + 0.14, TABLE_FORWARD_M + TABLE_RADIUS_M),
             heightMeters=SCALE_TEXT_HEIGHT_M * 0.6, color=(0.7, 0.75, 0.8))
-        hint.SetInput(_("L-stick: rotate   B/Y: scale   triggers: scene view"))
+        hint.SetInput(_("L-stick: rotate   R-stick: slice   B/Y: scale   triggers: scene view"))
         self._chromeProps.append(hint)
 
         for prop in self._chromeProps:
@@ -500,11 +518,10 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return max(projections) - min(projections)
 
     @staticmethod
-    def computePhysicalToWorld(baseMatrix, baseMagnification, magnification, angleRad,
-                               dataBounds, dataCenter, tablePhysical):
+    def computePhysicalToWorld(baseMatrix, relScale, angleRad, dataBounds, dataCenter, tablePhysical):
         """Pure helper (headless-testable). Build the VR PhysicalToWorldMatrix that makes the
-        data appear placed on the table, scaled to `magnification`, and spun by `angleRad`,
-        while keeping the reference-view orientation in `baseMatrix` (M0).
+        data appear placed on the table, scaled by world factor `relScale`, and spun by
+        `angleRad`, while keeping the reference-view orientation in `baseMatrix` (M0).
 
         We want the data to look transformed by a world-space transform W about its center:
             W = T(target) . R(worldUp, angle) . S(relScale) . T(-dataCenter)
@@ -514,8 +531,6 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         A point fixed in physical space then appears at E^-1 . p regardless of M, so the room
         chrome (anchored with UserMatrix = M) stays put while the data moves.
         """
-        relScale = (magnification / baseMagnification) if baseMagnification else 1.0
-
         # World "up" and the world point at the table location, both derived from M0.
         up = list(baseMatrix.MultiplyPoint([PHYSICAL_UP[0], PHYSICAL_UP[1], PHYSICAL_UP[2], 0.0]))[:3]
         norm = vtk.vtkMath.Norm(up)
@@ -572,17 +587,40 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         for prop in self._chromeProps:
             prop.Modified()
 
-    def _applyInitialFraming(self) -> None:
-        """Absolute framing used on enter and reset: data centered on the table at scale 1.0,
-        upright per the reference view captured on entry. Also undoes any gesture drift."""
+    def _computeFitRelScale(self):
+        """World scale factor that makes the data's diagonal span roughly the table diameter,
+        so 'scale 1.0' frames any data (tiny or huge) nicely on the table."""
+        if self._basePhysicalToWorld is None:
+            return 1.0
+        m = self._basePhysicalToWorld
+        # world units per physical unit at the reference view = length of a linear column.
+        sf0 = (m.GetElement(0, 0) ** 2 + m.GetElement(1, 0) ** 2 + m.GetElement(2, 0) ** 2) ** 0.5
+        b = self._dataBounds
+        if b[0] > b[1] or sf0 < 1e-9:
+            return 1.0
+        diagonal = ((b[1] - b[0]) ** 2 + (b[3] - b[2]) ** 2 + (b[5] - b[4]) ** 2) ** 0.5
+        if diagonal < 1e-6:
+            return 1.0
+        return (2.0 * TABLE_RADIUS_M * sf0) / diagonal
+
+    def _applyFraming(self) -> None:
+        """Absolute framing: data centered on the table, scaled by fit * user-scale, upright per
+        the reference view. Also clears any gesture drift."""
         if self._basePhysicalToWorld is None:
             return
+        relScale = self._fitRelScale * self._magnification
         matrix = self.computePhysicalToWorld(
-            self._basePhysicalToWorld, self._baseMagnification, DEFAULT_MAGNIFICATION,
-            0.0, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
-        self._magnification = DEFAULT_MAGNIFICATION
+            self._basePhysicalToWorld, relScale, 0.0, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
         self._setPhysicalToWorld(matrix)
         self._updateScaleReadout()
+
+    def _resetFraming(self) -> None:
+        """Recompute the data bounds + fit and reframe at user-scale 1.0 (used on enter, reset,
+        and after a scene-view change)."""
+        self._recomputeDataBounds()
+        self._fitRelScale = self._computeFitRelScale()
+        self._magnification = DEFAULT_MAGNIFICATION
+        self._applyFraming()
 
     def _incrementalWorldTransform(self, worldMatrix) -> None:
         """Apply a world-space transform to the current framing: newPTW = worldMatrix^-1 . PTW.
@@ -686,12 +724,40 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         t.GetMatrix(w)
         self._incrementalWorldTransform(w)
 
-    def _onRotationTimer(self) -> None:
-        if abs(self._leftStickX) < THUMBSTICK_DEADZONE:
-            return
-        speedRad = vtk.vtkMath.RadiansFromDegrees(self.getParameterNode().rotationSpeedDegPerSec)
-        dt = ROTATION_TIMER_INTERVAL_MS / 1000.0
-        self.rotateTurntable(speedRad * self._leftStickX * dt)
+    def toggleAutoSpin(self) -> None:
+        """Left menu button: hands-free presentation rotation (paused while the user drives
+        the left stick)."""
+        self._autoSpin = not self._autoSpin
+
+    def _onInputTimer(self) -> None:
+        dt = INPUT_TIMER_INTERVAL_MS / 1000.0
+
+        # Turntable: left stick drives it; otherwise auto-spin if enabled.
+        if abs(self._leftStickX) >= THUMBSTICK_DEADZONE:
+            speedRad = vtk.vtkMath.RadiansFromDegrees(self.getParameterNode().rotationSpeedDegPerSec)
+            self.rotateTurntable(speedRad * self._leftStickX * dt)
+        elif self._autoSpin:
+            self.rotateTurntable(vtk.vtkMath.RadiansFromDegrees(AUTO_SPIN_DEG_PER_SEC) * dt)
+
+        # Right stick vertical scrolls the active slice.
+        if abs(self._rightStickY) >= THUMBSTICK_DEADZONE:
+            self.scrollActiveSlice(SLICE_SCROLL_MM_PER_SEC * self._rightStickY * dt)
+
+    # ------------------------------------------------------------------ slice repositioning
+
+    def _activeSliceNode(self):
+        if 0 <= self._activeSliceIndex < len(SLICE_NODE_IDS):
+            return slicer.mrmlScene.GetNodeByID(SLICE_NODE_IDS[self._activeSliceIndex])
+        return None
+
+    def cycleActiveSlice(self) -> None:
+        """Right grip: advance which slice (Red -> Green -> Yellow) the right stick scrolls."""
+        self._activeSliceIndex = (self._activeSliceIndex + 1) % len(SLICE_NODE_IDS)
+
+    def scrollActiveSlice(self, deltaMm) -> None:
+        sliceNode = self._activeSliceNode()
+        if sliceNode is not None:
+            sliceNode.SetSliceOffset(sliceNode.GetSliceOffset() + deltaMm)
 
     # ------------------------------------------------------------------ magnification
 
@@ -731,9 +797,8 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self.setMagnification(self.steppedMagnification(self._magnification, direction, stepFactor))
 
     def resetMagnification(self) -> None:
-        """Left-stick click: recenter the data on the table at scale 1.0 (also clears gesture drift)."""
-        self._recomputeDataBounds()
-        self._applyInitialFraming()
+        """Left-stick click: refit the data on the table at scale 1.0 (also clears gesture drift)."""
+        self._resetFraming()
 
     # ------------------------------------------------------------------ slices
 
@@ -780,8 +845,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             return
         self._sceneViewIndex = (self._sceneViewIndex + (1 if direction > 0 else -1)) % count
         logic.RestoreSceneView(self._sceneViewIndex)
-        self._recomputeDataBounds()
-        self._applyInitialFraming()
+        self._resetFraming()
 
     # ------------------------------------------------------------------ controller observers
 
@@ -800,12 +864,15 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             self._observerTags.append(interactor.AddObserver(eventId, callback, highPriority))
 
         add(style.LeftThumbstickEvent, self._onLeftThumbstick)
+        add(style.RightThumbstickEvent, self._onRightThumbstick)   # vertical = scroll active slice
         add(style.RightButton2ClickEvent, self._onScaleUp)     # B
         add(style.LeftButton2ClickEvent, self._onScaleDown)    # Y
         add(style.RightTriggerClickEvent, self._onNextSceneView)
         add(style.LeftTriggerClickEvent, self._onPrevSceneView)
         add(style.RightThumbstickClickEvent, self._onToggleSlices)
         add(style.LeftThumbstickClickEvent, self._onResetScale)
+        add(style.RightGripClickEvent, self._onCycleActiveSlice)
+        add(style.LeftMenuClickEvent, self._onToggleAutoSpin)
 
         # Re-anchor the room whenever the world moves - including via the built-in A+X gesture.
         widget.connect("physicalToWorldMatrixModified()", self._onPhysicalToWorldModified)
@@ -871,6 +938,24 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         if self._isPress(calldata):
             self.toggleSlices()
 
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onRightThumbstick(self, caller, event, calldata):
+        try:
+            pos = calldata.GetTrackPadPosition()
+            self._rightStickY = float(pos[1])
+        except Exception:  # noqa: BLE001
+            self._rightStickY = 0.0
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onCycleActiveSlice(self, caller, event, calldata):
+        if self._isPress(calldata):
+            self.cycleActiveSlice()
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onToggleAutoSpin(self, caller, event, calldata):
+        if self._isPress(calldata):
+            self.toggleAutoSpin()
+
 
 #
 # VRViewerTest
@@ -898,12 +983,12 @@ class VRViewerTest(ScriptedLoadableModuleTest):
         self.assertEqual(logic.steppedMagnification(MAX_MAGNIFICATION, +1, 2.0), MAX_MAGNIFICATION)
         self.assertEqual(logic.steppedMagnification(MIN_MAGNIFICATION, -1, 2.0), MIN_MAGNIFICATION)
 
-        # With M0 = identity and matching magnifications, the data center appears at the table
-        # location: M maps the table physical point onto the data center (zero-extent data).
+        # With M0 = identity and relScale 1, the data center appears at the table location:
+        # M maps the table physical point onto the data center (zero-extent data).
         identity = vtk.vtkMatrix4x4()
         dataCenter = [10.0, 20.0, 30.0]
         emptyBounds = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]  # extent 0
-        m = logic.computePhysicalToWorld(identity, 1.0, 1.0, 0.0, emptyBounds, dataCenter, TABLE_PHYSICAL)
+        m = logic.computePhysicalToWorld(identity, 1.0, 0.0, emptyBounds, dataCenter, TABLE_PHYSICAL)
         mapped = m.MultiplyPoint([TABLE_PHYSICAL[0], TABLE_PHYSICAL[1], TABLE_PHYSICAL[2], 1.0])
         for a in range(3):
             self.assertAlmostEqual(mapped[a], dataCenter[a], places=4)

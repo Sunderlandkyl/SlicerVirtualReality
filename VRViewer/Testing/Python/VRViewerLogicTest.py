@@ -40,7 +40,7 @@ print("extentAlongAxis: OK")
 identity = vtk.vtkMatrix4x4()
 dataCenter = [10.0, 20.0, 30.0]
 emptyBounds = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]
-m = logic.computePhysicalToWorld(identity, 1.0, 1.0, 0.0, emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
+m = logic.computePhysicalToWorld(identity, 1.0, 0.0, emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
 mapped = m.MultiplyPoint([VRViewer.TABLE_PHYSICAL[0], VRViewer.TABLE_PHYSICAL[1], VRViewer.TABLE_PHYSICAL[2], 1.0])
 for a in range(3):
     assert abs(mapped[a] - dataCenter[a]) < 1e-4, (a, mapped[a], dataCenter[a])
@@ -48,21 +48,49 @@ for a in range(3):
 # Placement invariant holds at any rotation angle (data center stays on the table point).
 for angleDeg in (37.0, 90.0, 180.0):
     m = logic.computePhysicalToWorld(
-        identity, 1.0, 1.0, vtk.vtkMath.RadiansFromDegrees(angleDeg), emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
+        identity, 1.0, vtk.vtkMath.RadiansFromDegrees(angleDeg), emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
     mapped = m.MultiplyPoint([VRViewer.TABLE_PHYSICAL[0], VRViewer.TABLE_PHYSICAL[1], VRViewer.TABLE_PHYSICAL[2], 1.0])
     for a in range(3):
         assert abs(mapped[a] - dataCenter[a]) < 1e-4, (angleDeg, a)
 
-# Scale invariant: at magnification s (base 1), a world vector shrinks by 1/s in physical/view
-# space -> the M linear part scales an offset by 1/s. Check a +X offset from the data center.
-m2 = logic.computePhysicalToWorld(identity, 1.0, 2.0, 0.0, emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
+# Scale invariant: at relScale s, a world offset shrinks by 1/s in physical/view space.
+m2 = logic.computePhysicalToWorld(identity, 2.0, 0.0, emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
 inv = vtk.vtkMatrix4x4()
 vtk.vtkMatrix4x4.Invert(m2, inv)  # world -> physical
 centerPhys = inv.MultiplyPoint([dataCenter[0], dataCenter[1], dataCenter[2], 1.0])
 offsetPhys = inv.MultiplyPoint([dataCenter[0] + 100.0, dataCenter[1], dataCenter[2], 1.0])
 dist = ((offsetPhys[0] - centerPhys[0]) ** 2 + (offsetPhys[1] - centerPhys[1]) ** 2 + (offsetPhys[2] - centerPhys[2]) ** 2) ** 0.5
-assert abs(dist - 200.0) < 1e-3, dist  # 100 world units * (magnification 2) = 200 physical units
+assert abs(dist - 200.0) < 1e-3, dist  # 100 world units * relScale 2 = 200 physical units
 print("computePhysicalToWorld: OK")
+
+# Fit-to-table: with base scale factor sf0 (identity M0 -> sf0 = 1), the fit relScale makes the
+# data diagonal span the table diameter. A cube with diagonal D -> fitRelScale = 2*R_table/D.
+logic._basePhysicalToWorld = vtk.vtkMatrix4x4()  # identity, sf0 = 1
+logic._dataBounds = [-50.0, 50.0, -50.0, 50.0, -50.0, 50.0]  # 100 cube, diagonal = 100*sqrt(3)
+diag = (3 ** 0.5) * 100.0
+expectedFit = (2.0 * VRViewer.TABLE_RADIUS_M) / diag
+assert abs(logic._computeFitRelScale() - expectedFit) < 1e-9, logic._computeFitRelScale()
+logic._dataBounds = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]  # empty -> fit 1.0
+assert logic._computeFitRelScale() == 1.0
+logic._basePhysicalToWorld = None
+print("computeFitRelScale: OK")
+
+# Active-slice cycling wraps Red -> Green -> Yellow -> Red.
+logic._activeSliceIndex = 0
+seen = []
+for _i in range(4):
+    seen.append(VRViewer.SLICE_NODE_IDS[logic._activeSliceIndex])
+    logic.cycleActiveSlice()
+assert seen == [VRViewer.SLICE_NODE_IDS[0], VRViewer.SLICE_NODE_IDS[1], VRViewer.SLICE_NODE_IDS[2], VRViewer.SLICE_NODE_IDS[0]], seen
+print("cycleActiveSlice: OK")
+
+# Auto-spin toggles.
+logic._autoSpin = False
+logic.toggleAutoSpin()
+assert logic._autoSpin is True
+logic.toggleAutoSpin()
+assert logic._autoSpin is False
+print("toggleAutoSpin: OK")
 
 # ---------------------------------------------------------------- collection
 
@@ -99,6 +127,15 @@ if red is not None:
             assert abs(red.GetSliceToRAS().GetElement(r, c) - original.GetElement(r, c)) < 1e-9
     logic.toggleSlices()
     assert red.GetSliceVisible() == before
+
+    # scrollActiveSlice moves the active slice's offset by the requested amount.
+    logic._activeSliceIndex = 0  # Red
+    startOffset = red.GetSliceOffset()
+    logic.scrollActiveSlice(12.0)
+    assert abs(red.GetSliceOffset() - (startOffset + 12.0)) < 1e-6, red.GetSliceOffset()
+    logic.scrollActiveSlice(-12.0)
+    assert abs(red.GetSliceOffset() - startOffset) < 1e-6
+    print("scrollActiveSlice: OK")
     print("toggleSlices (visibility only, geometry untouched): OK")
 
 # ---------------------------------------------------------------- scene views
