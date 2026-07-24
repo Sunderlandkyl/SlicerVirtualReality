@@ -47,7 +47,7 @@ Controller bindings (Oculus Touch):
 - Right/Left trigger: next/previous scene view
 - Right thumbstick click: toggle slice visibility
 - Right grip: change which slice is active (Red/Green/Yellow)
-- Left thumbstick click: refit the data on the table (scale 1.0)
+- Left thumbstick click: recenter the data on the table (scale 1.0)
 - Left menu button: toggle hands-free auto-spin
 - Two-controller A+X gesture: freely move/scale/rotate (the room follows)
 """)
@@ -70,12 +70,16 @@ class VRViewerParameterNode:
     magnificationStep - multiplicative factor applied to world scale per +/- button press.
     includeSlices - if true, slice planes are shown on entry.
     showRoom - if true, room walls are drawn (the floor and table are always drawn).
+    fitToTable - if true, auto-scale each framing so the data spans the table. Off by default:
+        with it on, different scene views (with different data extents) land at very different
+        scales; off, every framing uses the same real-world scale (1.0 = normal VR size).
     """
 
     rotationSpeedDegPerSec: Annotated[float, WithinRange(1.0, 360.0)] = 45.0
     magnificationStep: Annotated[float, WithinRange(1.01, 4.0)] = 1.25
     includeSlices: bool = True
     showRoom: bool = True
+    fitToTable: bool = False
 
 
 #
@@ -228,6 +232,8 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         # Runtime VR handles (only valid while active).
         self._interactor = None
         self._observerTags = []
+        self._rightStickPosTag = None
+        self._rightStickTouchTag = None
         self._physicalToWorldConnected = False
 
         # Chrome (raw VTK props, not MRML). Anchored to physical space via _anchorMatrix,
@@ -241,8 +247,8 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         # upright orientation.
         self._basePhysicalToWorld = None     # M0 captured at enter
         self._savedPhysicalToWorld = None     # restored on exit
-        self._magnification = DEFAULT_MAGNIFICATION   # user-facing scale (1.0 = fitted to table)
-        self._fitRelScale = 1.0                        # world scale that fits data to the table
+        self._magnification = DEFAULT_MAGNIFICATION   # cached displayed scale (derived from the matrix)
+        self._fitRelScale = 1.0                        # framing scale (1.0, or fit-to-table if enabled)
         self._dataBounds = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         self._dataCenter = [0.0, 0.0, 0.0]
 
@@ -283,15 +289,21 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         except Exception:  # noqa: BLE001
             return None
 
+    def _renderWindow(self):
+        """The VR render window, or None. The widget can exist while VR is inactive, in which
+        case renderWindow() is None - callers must tolerate that."""
+        widget = self._vrViewWidget()
+        return widget.renderWindow() if widget is not None else None
+
     def _vrViewNode(self):
         vrLogic = self._vrLogic()
         return vrLogic.GetVirtualRealityViewNode() if vrLogic else None
 
     def _vrRenderer(self):
-        widget = self._vrViewWidget()
-        if not widget:
+        renderWindow = self._renderWindow()
+        if renderWindow is None:
             return None
-        renderers = widget.renderWindow().GetRenderers()
+        renderers = renderWindow.GetRenderers()
         if renderers.GetNumberOfItems() < 1:
             return None
         return renderers.GetItemAsObject(0)
@@ -370,9 +382,10 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
         widget = self._vrViewWidget()
         if widget is not None:
-            if self._savedPhysicalToWorld is not None:
+            renderWindow = self._renderWindow()
+            if renderWindow is not None and self._savedPhysicalToWorld is not None:
                 try:
-                    widget.renderWindow().SetPhysicalToWorldMatrix(self._savedPhysicalToWorld)
+                    renderWindow.SetPhysicalToWorldMatrix(self._savedPhysicalToWorld)
                 except Exception:  # noqa: BLE001
                     pass
             if self._savedDolly is not None:
@@ -499,6 +512,9 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return actor
 
     def _updateScaleReadout(self) -> None:
+        # Derive the displayed scale from the actual matrix so it reflects any source of change,
+        # including the built-in A+X gesture - not just our +/- steps.
+        self._magnification = self._currentScale()
         if self._scaleTextActor is not None:
             self._scaleTextActor.SetInput(
                 _("Scale: {scale:.2f}x").format(scale=self._magnification))
@@ -558,19 +574,19 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return result
 
     def _currentPhysicalToWorld(self):
-        widget = self._vrViewWidget()
-        if widget is None:
+        renderWindow = self._renderWindow()
+        if renderWindow is None:
             return None
         matrix = vtk.vtkMatrix4x4()
-        widget.renderWindow().GetPhysicalToWorldMatrix(matrix)
+        renderWindow.GetPhysicalToWorldMatrix(matrix)
         return matrix
 
     def _setPhysicalToWorld(self, matrix) -> None:
-        widget = self._vrViewWidget()
-        if widget is None:
+        renderWindow = self._renderWindow()
+        if renderWindow is None:
             return
         try:
-            widget.renderWindow().SetPhysicalToWorldMatrix(matrix)
+            renderWindow.SetPhysicalToWorldMatrix(matrix)
         except Exception:  # noqa: BLE001
             logging.warning("VRViewer: unable to set PhysicalToWorldMatrix")
         self._reanchorChrome(matrix)
@@ -604,22 +620,21 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return (2.0 * TABLE_RADIUS_M * sf0) / diagonal
 
     def _applyFraming(self) -> None:
-        """Absolute framing: data centered on the table, scaled by fit * user-scale, upright per
-        the reference view. Also clears any gesture drift."""
+        """Absolute framing: data centered on the table at the framing scale (1.0 = normal VR
+        size, or fitted if the option is on), upright per the reference view, rotation reset.
+        Also clears any gesture drift."""
         if self._basePhysicalToWorld is None:
             return
-        relScale = self._fitRelScale * self._magnification
         matrix = self.computePhysicalToWorld(
-            self._basePhysicalToWorld, relScale, 0.0, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
+            self._basePhysicalToWorld, self._fitRelScale, 0.0, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
         self._setPhysicalToWorld(matrix)
         self._updateScaleReadout()
 
     def _resetFraming(self) -> None:
-        """Recompute the data bounds + fit and reframe at user-scale 1.0 (used on enter, reset,
-        and after a scene-view change)."""
+        """Recompute the data bounds and reframe (used on enter, reset, and after a scene-view
+        change). Fit-to-table is opt-in; otherwise the framing scale is a constant 1.0."""
         self._recomputeDataBounds()
-        self._fitRelScale = self._computeFitRelScale()
-        self._magnification = DEFAULT_MAGNIFICATION
+        self._fitRelScale = self._computeFitRelScale() if self.getParameterNode().fitToTable else 1.0
         self._applyFraming()
 
     def _incrementalWorldTransform(self, worldMatrix) -> None:
@@ -643,8 +658,26 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         axle = list(matrix.MultiplyPoint([TABLE_PHYSICAL[0], TABLE_PHYSICAL[1], TABLE_PHYSICAL[2], 1.0]))[:3]
         return up, axle
 
+    @staticmethod
+    def _linearScale(matrix):
+        """World-per-physical scale factor of a PhysicalToWorld matrix (length of a column)."""
+        return (matrix.GetElement(0, 0) ** 2 + matrix.GetElement(1, 0) ** 2
+                + matrix.GetElement(2, 0) ** 2) ** 0.5
+
+    def _currentScale(self) -> float:
+        """Apparent data scale relative to the reference view (1.0 = normal VR size). Derived
+        from the live matrices, so it reflects our controls AND the complex gesture."""
+        current = self._currentPhysicalToWorld()
+        if current is None or self._basePhysicalToWorld is None:
+            return self._magnification
+        sCur = self._linearScale(current)
+        if sCur < 1e-12:
+            return self._magnification
+        return self._linearScale(self._basePhysicalToWorld) / sCur
+
     def _onPhysicalToWorldModified(self, caller=None, event=None) -> None:
         self._reanchorChrome()
+        self._updateScaleReadout()
 
     # ------------------------------------------------------------------ data collection
 
@@ -762,7 +795,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------ magnification
 
     def getMagnification(self) -> float:
-        return self._magnification
+        return self._currentScale()
 
     @staticmethod
     def steppedMagnification(current, direction, stepFactor):
@@ -771,15 +804,17 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return max(MIN_MAGNIFICATION, min(MAX_MAGNIFICATION, value))
 
     def setMagnification(self, value) -> None:
-        """Scale the world about the table axle to the requested magnification (relative to the
-        current tracked value), so it composes with the gesture rather than snapping."""
-        newMag = max(MIN_MAGNIFICATION, min(MAX_MAGNIFICATION, value))
+        """Scale the world about the table axle to the requested scale (relative to the actual
+        current scale), so it composes with the gesture rather than snapping."""
         current = self._currentPhysicalToWorld()
-        if current is None or self._magnification <= 0:
-            self._magnification = newMag
+        if current is None:
+            self._magnification = value
             return
-        factor = newMag / self._magnification
-        self._magnification = newMag
+        currentScale = self._currentScale()
+        newScale = max(MIN_MAGNIFICATION, min(MAX_MAGNIFICATION, value))
+        if currentScale <= 0:
+            return
+        factor = newScale / currentScale
         if abs(factor - 1.0) > 1e-9:
             up, axle = self._tableAxle(current)
             t = vtk.vtkTransform()
@@ -794,10 +829,11 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
     def stepMagnification(self, direction) -> None:
         stepFactor = self.getParameterNode().magnificationStep
-        self.setMagnification(self.steppedMagnification(self._magnification, direction, stepFactor))
+        self.setMagnification(self.steppedMagnification(self._currentScale(), direction, stepFactor))
 
     def resetMagnification(self) -> None:
-        """Left-stick click: refit the data on the table at scale 1.0 (also clears gesture drift)."""
+        """Left-stick click: recenter the data on the table at scale 1.0, rotation zeroed
+        (also clears any gesture drift)."""
         self._resetFraming()
 
     # ------------------------------------------------------------------ slices
@@ -864,7 +900,12 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             self._observerTags.append(interactor.AddObserver(eventId, callback, highPriority))
 
         add(style.LeftThumbstickEvent, self._onLeftThumbstick)
-        add(style.RightThumbstickEvent, self._onRightThumbstick)   # vertical = scroll active slice
+        # Right thumbstick is repurposed for slice scroll; its position AND touch events are
+        # translated to fly/dolly by default, so we observe both at high priority and abort them.
+        self._rightStickPosTag = interactor.AddObserver(style.RightThumbstickEvent, self._onRightThumbstick, highPriority)
+        self._rightStickTouchTag = interactor.AddObserver(style.RightThumbstickTouchEvent, self._onRightThumbstickTouch, highPriority)
+        self._observerTags.append(self._rightStickPosTag)
+        self._observerTags.append(self._rightStickTouchTag)
         add(style.RightButton2ClickEvent, self._onScaleUp)     # B
         add(style.LeftButton2ClickEvent, self._onScaleDown)    # Y
         add(style.RightTriggerClickEvent, self._onNextSceneView)
@@ -938,6 +979,13 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         if self._isPress(calldata):
             self.toggleSlices()
 
+    def _abort(self, tag):
+        """Stop the default (lower-priority) processing of an event we've taken over."""
+        if self._interactor is not None:
+            command = self._interactor.GetCommand(tag)
+            if command is not None:
+                command.AbortFlagOn()
+
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onRightThumbstick(self, caller, event, calldata):
         try:
@@ -945,6 +993,13 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             self._rightStickY = float(pos[1])
         except Exception:  # noqa: BLE001
             self._rightStickY = 0.0
+        self._abort(self._rightStickPosTag)  # suppress default fly/dolly
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onRightThumbstickTouch(self, caller, event, calldata):
+        # Touch down/up also drives fly start/stop by default; suppress it.
+        self._rightStickY = 0.0
+        self._abort(self._rightStickTouchTag)
 
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onCycleActiveSlice(self, caller, event, calldata):

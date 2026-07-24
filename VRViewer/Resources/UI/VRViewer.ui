@@ -147,6 +147,22 @@
         </property>
        </widget>
       </item>
+      <item row="4" column="0" colspan="2">
+       <widget class="QCheckBox" name="fitToTableCheckBox">
+        <property name="toolTip">
+         <string>Auto-scale the data to span the table on each framing. Off by default so scene views keep a consistent real-world scale.</string>
+        </property>
+        <property name="text">
+         <string>Fit data to table</string>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>fitToTable</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
