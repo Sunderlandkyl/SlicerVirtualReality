@@ -2,7 +2,9 @@ import logging
 import math
 from typing import Annotated
 
+import numpy as np
 import vtk
+from vtk.util import numpy_support
 import qt
 
 import slicer
@@ -199,7 +201,137 @@ TABLE_FORWARD_M = -0.60         # distance in front of the user (-Z)
 COLUMN_RADIUS_M = 0.08
 ROOM_SIZE_M = (6.0, 3.0, 6.0)   # width (X), height (Y), depth (Z)
 ROOM_CENTER_Y_M = 1.5
-SCALE_TEXT_HEIGHT_M = 0.04
+
+# Raised collar/apron band around the table's whole perimeter, sitting directly under the
+# tabletop cap (in the space otherwise occupied only by the thin column) - gives the table a
+# real, constructed pedestal-table silhouette (post -> collar -> cap) instead of a plain disc,
+# and gives the monitor housing (see MONITOR_* below) a wide, sturdy-looking base to be mounted
+# into. Inset from TABLE_RADIUS_M so the cap overhangs the collar as a lip.
+RIM_BAND_RADIUS_M = TABLE_RADIUS_M * 0.90
+RIM_BAND_HEIGHT_M = 0.22          # must clear the monitor housing's footprint, see MONITOR_* below
+
+# Bright "medical sci-fi" palette: cool steel room/floor with a cyan holo-tech accent used for
+# every glowing trim/rim/readout, so the room reads as one coherent kit of parts rather than a
+# grab-bag of colors.
+ACCENT_COLOR = (0.25, 0.85, 1.0)
+ACCENT_COLOR_DIM = (0.10, 0.35, 0.42)
+FLOOR_BASE_COLOR = (0.62, 0.68, 0.75)
+WALL_BASE_COLOR = (0.80, 0.85, 0.90)
+COLUMN_COLOR = (0.30, 0.34, 0.40)
+TABLE_RING_COLOR = (0.40, 0.46, 0.54)
+TABLE_SCREEN_BG_COLOR = (0.03, 0.07, 0.11)
+RIM_BAND_COLOR = (0.34, 0.38, 0.44)   # between COLUMN_COLOR and TABLE_RING_COLOR
+
+# Table "screen" (the circular holo-readout inset in the tabletop), as a fraction of
+# TABLE_RADIUS_M so it scales if the table size is tuned. Recessed below the surrounding cap's
+# top surface (see _annulusActor) rather than sitting proud on it, so it reads as a screen sunk
+# into the table rather than a decal stuck on top - must leave enough floor thickness below it
+# (TABLE_TOP_THICKNESS_M - RECESS_DEPTH_M) to still read as solid.
+TABLE_SCREEN_RADIUS_FRAC = 0.85
+TABLE_SCREEN_RECESS_DEPTH_M = 0.015
+# Emissive glow for the screen's texture (see _tableScreenTexture) - lets the circuit/ring
+# pattern read as self-lit "holo" tech, independent of the overhead light rig, using VTK's PBR
+# emissive-texture pipeline rather than the plain ambient-only trick used for the ring/rim glows.
+TABLE_SCREEN_EMISSIVE_FACTOR = (1.0, 1.0, 1.0)
+
+# Seam-line glow ring marking where the cap overhangs the collar (see RIM_BAND_RADIUS_M), as
+# fractions of RIM_BAND_RADIUS_M rather than TABLE_RADIUS_M since it now trims the collar, not
+# the cap's own edge.
+COLLAR_SEAM_RING_INNER_FRAC = 0.97
+COLLAR_SEAM_RING_OUTER_FRAC = 1.01
+
+# Floor "landing pad" glow ring drawn around the table's footprint.
+FLOOR_RING_INNER_M = TABLE_RADIUS_M + 0.25
+FLOOR_RING_OUTER_M = TABLE_RADIUS_M + 0.32
+
+# Back-wall signage: the control-scheme text lives on the wall behind the table (rather than
+# crowding the table edge closest to the user), keeping the table itself uncluttered so the
+# anatomy on it is easy to read accurately.
+# The panel/text are held noticeably proud of the actual wall (tens of cm, not mm) - at the
+# ~3m viewing distance out here, the same absolute gap that looks fine on the nearby table (see
+# the mm-scale offsets above) resolves to far less usable z-buffer precision, so a small gap
+# z-fights. The panel border is baked into its texture (see _signagePanelTexture) rather than
+# a second coincident plane, for the same reason.
+BACK_WALL_Z_M = -(ROOM_SIZE_M[2] / 2.0) + 0.05
+BACK_WALL_PANEL_OFFSET_M = 0.20   # panel in front of the wall
+BACK_WALL_TEXT_OFFSET_M = 0.24    # text in front of the wall (i.e. ~4cm proud of the panel)
+HELP_PANEL_CENTER_Y_M = ROOM_CENTER_Y_M + 0.35
+HELP_PANEL_WIDTH_M = 2.4
+HELP_TITLE_HEIGHT_M = 0.14
+HELP_BODY_HEIGHT_M = 0.085
+HELP_BODY_LINE_COUNT = 8          # keep in sync with the body text in _backWallSignageActors
+HELP_TITLE_BODY_GAP_M = 0.05      # deliberate breathing room between title and body
+HELP_PANEL_TEXT_MARGIN_M = 0.05   # from the usable (border-excluded) interior edge to the text
+HELP_PANEL_BORDER_FRAC = 0.05     # must match _signagePanelTexture's default borderFrac
+
+# HELP_PANEL_HEIGHT_M is derived, not hand-tuned: vtkTextActor3D's rendered height for N lines at
+# heightMeters is always <= N * heightMeters (measured ~0.955x), so budgeting with the nominal
+# heightMeters values here is already conservative. Deriving the panel height from that budget -
+# instead of picking one by eye - keeps title+body guaranteed to fit inside the border (previously
+# they didn't) if the body text or font sizes above are ever edited.
+_HELP_BODY_BLOCK_HEIGHT_M = HELP_BODY_LINE_COUNT * HELP_BODY_HEIGHT_M
+_HELP_CONTENT_HEIGHT_M = (2.0 * HELP_PANEL_TEXT_MARGIN_M + HELP_TITLE_HEIGHT_M
+                           + HELP_TITLE_BODY_GAP_M + _HELP_BODY_BLOCK_HEIGHT_M)
+HELP_PANEL_HEIGHT_M = _HELP_CONTENT_HEIGHT_M / (1.0 - 2.0 * HELP_PANEL_BORDER_FRAC)
+
+# Info screen content: the live scale (line 1) and current scene view name (line 2), rendered
+# on the monitor housing built into the table's collar (see MONITOR_* below). Text layout is
+# unchanged from the module's original standing-sign design - only the housing/mounting geometry
+# around it changed.
+INFO_SCREEN_LINE_HEIGHT_M = 0.035
+INFO_SCREEN_LINE_GAP_M = 0.015
+INFO_SCREEN_TEXT_MARGIN_M = 0.02
+INFO_SCREEN_BORDER_FRAC = 0.05    # must match _signagePanelTexture's default borderFrac
+# Scene view names are free text; truncated (with an ellipsis) so the panel width stays bounded
+# even against a worst-case string of wide capital letters (checked headlessly), not just typical
+# mixed-case names.
+INFO_SCREEN_NAME_MAX_CHARS = 12
+
+_INFO_SCREEN_CONTENT_HEIGHT_M = (2.0 * INFO_SCREEN_TEXT_MARGIN_M + 2.0 * INFO_SCREEN_LINE_HEIGHT_M
+                                  + INFO_SCREEN_LINE_GAP_M)
+INFO_SCREEN_HEIGHT_M = _INFO_SCREEN_CONTENT_HEIGHT_M / (1.0 - 2.0 * INFO_SCREEN_BORDER_FRAC)
+
+# Monitor housing: a physically-modeled screen module (housing shell + textured screen face +
+# live text), mounted into the table's collar near the edge closest to the user, reclined so
+# it's legible without standing tall enough to occlude anatomy sitting further back on the
+# table. See _buildMonitorAssembly.
+MONITOR_SCREEN_WIDTH_M = 0.24        # narrower than the old standing sign - reads as one
+                                       # embedded module now, not a sign
+MONITOR_BEZEL_MARGIN_M = 0.025       # housing overhang beyond the screen face, per side
+MONITOR_HOUSING_DEPTH_M = 0.05
+MONITOR_SCREEN_PROUD_M = 0.006       # screen face proud of the housing shell's front face
+MONITOR_TEXT_PROUD_M = 0.01          # text proud of the screen face
+MONITOR_MOUNT_PROUD_M = 0.015        # housing pulled proud of the collar's tangent radius
+# RIM_BAND_HEIGHT_M must exceed the housing's bezel-inclusive footprint
+# (INFO_SCREEN_HEIGHT_M + 2*MONITOR_BEZEL_MARGIN_M =~ 0.189m) so it fits inside the collar band
+# with clearance top and bottom (checked, not eyeballed): 0.22m leaves ~1.5cm each side.
+MONITOR_TILT_FROM_HORIZONTAL_DEG = 27.5   # midpoint of the agreed-on 25-30 degree recline
+# The panel/text are authored in a vertical ("standing sign") local frame, same as the module's
+# original design, then pivoted back to the shallow recline as one rigid group - see
+# _buildMonitorAssembly for why a vtkAssembly pivot is used instead of repositioning each part.
+MONITOR_HINGE_ROTATION_DEG = 90.0 - MONITOR_TILT_FROM_HORIZONTAL_DEG
+
+# R/L/A/P/S/I orientation labels are authored directly in RAS/world (not anchored to physical
+# space like the rest of the chrome - see _updateOrientationLabels), so they turn with the
+# anatomy as the turntable spins and always show which anatomical direction currently faces the
+# user. vtkBillboardTextActor3D keeps a constant on-screen size and always faces the camera.
+ORIENTATION_LABEL_AXES = {
+    "R": (1.0, 0.0, 0.0),
+    "L": (-1.0, 0.0, 0.0),
+    "A": (0.0, 1.0, 0.0),
+    "P": (0.0, -1.0, 0.0),
+    "S": (0.0, 0.0, 1.0),
+    "I": (0.0, 0.0, -1.0),
+}
+ORIENTATION_LABEL_MARGIN_MM = 40.0
+ORIENTATION_LABEL_DEFAULT_RADIUS_MM = 150.0
+ORIENTATION_LABEL_FONT_SIZE = 22
+
+# Extra clearance between the anatomy's bottom and the table surface (see computePhysicalToWorld),
+# so the data floats just above the table instead of sitting flush against it. Kept comfortably
+# larger than ORIENTATION_LABEL_MARGIN_MM so the I label (which sits that margin below the data's
+# bottom) still clears the table surface too, rather than poking into it.
+TABLE_LIFT_BUFFER_MM = 60.0
 
 # The physical point the data center is placed at (table top), and the physical "up" direction
 # (true gravity) - the room chrome (floor/table/walls) is authored directly in physical meters
@@ -270,7 +402,21 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         # which is kept equal to the VR PhysicalToWorldMatrix we apply.
         self._chromeProps = []
         self._scaleTextActor = None
+        self._sceneViewTextActor = None
+        self._monitorAssembly = None
         self._anchorMatrix = vtk.vtkMatrix4x4()
+
+        # Table screen (the holo-readout inset): anchored like the rest of the chrome, but also
+        # carries its own extra spin - see _updateTableScreenOrientation - so its texture visibly
+        # turns along with the turntable instead of staying screen-fixed like the rest of the
+        # table.
+        self._tableScreenActor = None
+        self._turntableAngleRad = 0.0
+
+        # R/L/A/P/S/I orientation labels. Unlike _chromeProps these are authored directly in
+        # RAS/world space (no UserMatrix) so they turn with the anatomy - see
+        # _updateOrientationLabels.
+        self._orientationLabelActors = {}
 
         # Overhead light rig, anchored to physical space the same way as the chrome. When
         # active it replaces the VR view's default lights (captured/detached in
@@ -458,41 +604,258 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         """Create the room/floor/table/text props (authored in physical meters) and add them
         to the VR renderer. They are anchored to physical space in _reanchorChrome()."""
         params = self.getParameterNode()
+        tableCenterXZ = (0.0, TABLE_FORWARD_M)
 
         floor = self._discActor(
             center=(0.0, FLOOR_THICKNESS_M / 2.0, 0.0),
-            radius=FLOOR_RADIUS_M, height=FLOOR_THICKNESS_M, color=(0.18, 0.20, 0.24))
+            radius=FLOOR_RADIUS_M, height=FLOOR_THICKNESS_M, color=FLOOR_BASE_COLOR)
+        floorGrid = self._texturedDiscActor(
+            center=(0.0, FLOOR_THICKNESS_M + 0.001, 0.0),
+            radius=FLOOR_RADIUS_M, texture=self._arrayToTexture(self._floorPanelTexture()),
+            ambient=0.55, diffuse=0.35)
+        floorRing = self._glowRingActor(
+            center=(tableCenterXZ[0], FLOOR_THICKNESS_M + 0.002, tableCenterXZ[1]),
+            innerRadius=FLOOR_RING_INNER_M, outerRadius=FLOOR_RING_OUTER_M,
+            color=ACCENT_COLOR, opacity=0.85)
 
         column = self._discActor(
             center=(0.0, TABLE_HEIGHT_M / 2.0, TABLE_FORWARD_M),
-            radius=COLUMN_RADIUS_M, height=TABLE_HEIGHT_M, color=(0.30, 0.34, 0.40))
+            radius=COLUMN_RADIUS_M, height=TABLE_HEIGHT_M, color=COLUMN_COLOR)
+        columnBand = self._glowRingActor(
+            center=(tableCenterXZ[0], TABLE_HEIGHT_M * 0.30, tableCenterXZ[1]),
+            innerRadius=0.0, outerRadius=COLUMN_RADIUS_M * 1.02,
+            color=ACCENT_COLOR_DIM, opacity=0.9)
 
-        tableTop = self._discActor(
-            center=(0.0, TABLE_HEIGHT_M + TABLE_TOP_THICKNESS_M / 2.0, TABLE_FORWARD_M),
-            radius=TABLE_RADIUS_M, height=TABLE_TOP_THICKNESS_M, color=(0.35, 0.50, 0.68))
+        # Raised collar/apron band circling the table, sitting directly under the cap (in the
+        # space otherwise occupied only by the thin column) - gives the table a real pedestal
+        # silhouette (post -> collar -> cap) and a wide base for the monitor housing to mount
+        # into. It's wider than the column, so the two simply overlap; no boolean needed.
+        collar = self._discActor(
+            center=(0.0, TABLE_HEIGHT_M - RIM_BAND_HEIGHT_M / 2.0, TABLE_FORWARD_M),
+            radius=RIM_BAND_RADIUS_M, height=RIM_BAND_HEIGHT_M, color=RIM_BAND_COLOR)
+        collar.GetProperty().SetMetallic(0.6)
 
-        self._chromeProps = [floor, column, tableTop]
+        tableTopY = TABLE_HEIGHT_M + TABLE_TOP_THICKNESS_M
+        tableScreenRadius = TABLE_RADIUS_M * TABLE_SCREEN_RADIUS_FRAC
+        # The cap is now a ring with a real hole (not a solid disc) so the table screen sits in an
+        # actual recessed pocket instead of proud on top of it - the well floor below fills the
+        # hole except for the top TABLE_SCREEN_RECESS_DEPTH_M, which is the pocket's visible depth.
+        tableTopRing = self._annulusActor(
+            center=(0.0, tableTopY, TABLE_FORWARD_M),
+            innerRadius=tableScreenRadius, outerRadius=TABLE_RADIUS_M,
+            height=TABLE_TOP_THICKNESS_M, color=TABLE_RING_COLOR)
+        tableTopRing.GetProperty().SetMetallic(1.0)
+        wellFloorHeight = TABLE_TOP_THICKNESS_M - TABLE_SCREEN_RECESS_DEPTH_M
+        tableWellFloor = self._discActor(
+            center=(0.0, TABLE_HEIGHT_M + wellFloorHeight / 2.0, TABLE_FORWARD_M),
+            radius=tableScreenRadius, height=wellFloorHeight, color=TABLE_RING_COLOR)
+        tableWellFloor.GetProperty().SetMetallic(1.0)
+        tableScreenTexture = self._arrayToTexture(self._tableScreenTexture())
+        self._tableScreenActor = self._texturedDiscActor(
+            center=(tableCenterXZ[0], TABLE_HEIGHT_M + wellFloorHeight + 0.002, tableCenterXZ[1]),
+            radius=tableScreenRadius, texture=tableScreenTexture, ambient=0.85, diffuse=0.15)
+        # Emissive: the screen reads as self-lit "holo" tech, independent of the room's lighting,
+        # rather than just a lit texture - only the PBR interpolation model supports emissive
+        # textures (see vtkProperty.SetEmissiveTexture), so switch this actor onto that pipeline
+        # and feed it the same baked texture as both the base color and the emissive source.
+        screenProp = self._tableScreenActor.GetProperty()
+        screenProp.SetInterpolationToPBR()
+        tableScreenTexture.UseSRGBColorSpaceOn()  # required for albedo/emissive textures
+        screenProp.SetBaseColorTexture(tableScreenTexture)
+        screenProp.SetEmissiveTexture(tableScreenTexture)
+        screenProp.SetEmissiveFactor(*TABLE_SCREEN_EMISSIVE_FACTOR)
+        self._turntableAngleRad = 0.0
+        self._updateTableScreenOrientation()
+        # Seam-line trim on the cap's top surface, directly above where the narrower collar ends
+        # below it (an "under-cap" accent marking the structural seam) - stays on TOP of the cap
+        # like the original table-edge ring did, since a ring drawn at the actual seam height
+        # would sit exactly inside/under the cap's own opaque bottom face and never be visible.
+        collarSeamRing = self._glowRingActor(
+            center=(tableCenterXZ[0], tableTopY + 0.003, tableCenterXZ[1]),
+            innerRadius=RIM_BAND_RADIUS_M * COLLAR_SEAM_RING_INNER_FRAC,
+            outerRadius=RIM_BAND_RADIUS_M * COLLAR_SEAM_RING_OUTER_FRAC,
+            color=ACCENT_COLOR_DIM, opacity=0.75)
+
+        self._chromeProps = [
+            floor, floorGrid, floorRing,
+            column, columnBand, collar,
+            tableTopRing, tableWellFloor, self._tableScreenActor, collarSeamRing,
+        ]
 
         if params.showRoom:
-            self._chromeProps.append(self._roomActor())
+            self._chromeProps.append(self._roomActor(self._arrayToTexture(self._wallPanelTexture())))
+            self._chromeProps.extend(self._backWallSignageActors())
 
-        # Scale readout on the front edge of the table, facing the user (+Z).
-        self._scaleTextActor = self._textActor(
-            position=(0.0, TABLE_HEIGHT_M + 0.06, TABLE_FORWARD_M + TABLE_RADIUS_M),
-            heightMeters=SCALE_TEXT_HEIGHT_M)
-        self._chromeProps.append(self._scaleTextActor)
-
-        hint = self._textActor(
-            position=(0.0, TABLE_HEIGHT_M + 0.14, TABLE_FORWARD_M + TABLE_RADIUS_M),
-            heightMeters=SCALE_TEXT_HEIGHT_M * 0.6, color=(0.7, 0.75, 0.8))
-        hint.SetInput(_("L-stick: rotate   R-stick: slice   B/Y: scale   triggers: scene view"))
-        self._chromeProps.append(hint)
+        self._monitorAssembly = self._buildMonitorAssembly()
+        self._chromeProps.append(self._monitorAssembly)
 
         for prop in self._chromeProps:
             prop.SetUserMatrix(self._anchorMatrix)  # shared matrix, updated by _reanchorChrome
             renderer.AddViewProp(prop)
 
+        self._buildOrientationLabels(renderer)
+
         self._updateScaleReadout()
+        self._updateSceneViewReadout()
+
+    @staticmethod
+    def _signagePanelTexture(size=512, borderFrac=0.05):
+        """Dark background with an accent border baked in - a single plane can then carry the
+        whole panel look, instead of stacking a separate border plane nearly coincident with it
+        (see BACK_WALL_PANEL_OFFSET_M for why that stacking z-fights at this distance)."""
+        bg = np.array(TABLE_SCREEN_BG_COLOR) * 255.0
+        border = np.array(ACCENT_COLOR) * 255.0
+        img = np.tile(bg.astype(np.uint8), (size, size, 1))
+        edge = int(size * borderFrac)
+        img[:edge, :, :] = border.astype(np.uint8)
+        img[-edge:, :, :] = border.astype(np.uint8)
+        img[:, :edge, :] = border.astype(np.uint8)
+        img[:, -edge:, :] = border.astype(np.uint8)
+        return img
+
+    @staticmethod
+    def _backWallSignageActors():
+        """A signage panel on the back wall, behind the table, holding the control-scheme text
+        that used to crowd the table's front edge - keeps the table itself uncluttered while
+        staying legible at the wall's distance from the user."""
+        halfW = HELP_PANEL_WIDTH_M / 2.0
+        halfH = HELP_PANEL_HEIGHT_M / 2.0
+        panelSource = vtk.vtkPlaneSource()
+        panelSource.SetOrigin(-halfW, -halfH, 0.0)
+        panelSource.SetPoint1(halfW, -halfH, 0.0)
+        panelSource.SetPoint2(-halfW, halfH, 0.0)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(panelSource.GetOutputPort())
+        panel = vtk.vtkActor()
+        panel.SetMapper(mapper)
+        panel.SetTexture(VRViewerLogic._arrayToTexture(VRViewerLogic._signagePanelTexture()))
+        panel.SetPosition(0.0, HELP_PANEL_CENTER_Y_M, BACK_WALL_Z_M + BACK_WALL_PANEL_OFFSET_M)
+        panelProp = panel.GetProperty()
+        panelProp.SetColor(1.0, 1.0, 1.0)
+        panelProp.SetAmbient(0.9)
+        panelProp.SetDiffuse(0.1)
+        panel.PickableOff()
+
+        # Both anchored bottom-up (vtkTextActor3D's VerticalJustificationToBottom): title sits
+        # just inside the top border, body's bottom is placed so title-bottom .. body-top leaves
+        # exactly HELP_TITLE_BODY_GAP_M, and body-bottom lands (by construction of
+        # HELP_PANEL_HEIGHT_M above) just inside the bottom border.
+        interiorHalfH = halfH * (1.0 - 2.0 * HELP_PANEL_BORDER_FRAC)
+        titleBottomY = HELP_PANEL_CENTER_Y_M + interiorHalfH - HELP_PANEL_TEXT_MARGIN_M - HELP_TITLE_HEIGHT_M
+        bodyBottomY = titleBottomY - HELP_TITLE_BODY_GAP_M - _HELP_BODY_BLOCK_HEIGHT_M
+
+        textZ = BACK_WALL_Z_M + BACK_WALL_TEXT_OFFSET_M
+        title = VRViewerLogic._textActor(
+            position=(0.0, titleBottomY, textZ),
+            heightMeters=HELP_TITLE_HEIGHT_M, color=ACCENT_COLOR)
+        title.SetInput(_("VR VIEWER CONTROLS"))
+
+        body = VRViewerLogic._textActor(
+            position=(0.0, bodyBottomY, textZ),
+            heightMeters=HELP_BODY_HEIGHT_M, color=(0.75, 0.90, 0.95))
+        body.SetInput(_(
+            "L-stick: rotate turntable\n"
+            "R-stick: scroll active slice\n"
+            "B / Y: scale up / down\n"
+            "L/R trigger: previous / next scene view\n"
+            "R-stick click: toggle slices\n"
+            "R grip: cycle active slice\n"
+            "L-stick click: reset framing\n"
+            "L menu: toggle auto-spin"))
+
+        return [panel, title, body]
+
+    def _buildMonitorAssembly(self):
+        """The live info readout (current scale + scene view name), mounted as a monitor built
+        into the table's collar (see RIM_BAND_* / MONITOR_* above) instead of standing as a sign
+        on the flat top - the old sign stood tall enough at the table's near edge to occlude the
+        anatomy sitting on the table behind it.
+
+        The housing/screen/text are authored in a simple vertical, "standing sign" local frame -
+        the same layout math the module always used for the info screen - with the housing's TOP
+        edge at the collar/cap seam and the housing extending DOWN into the collar below it. A
+        single vtkAssembly groups all the parts and pivots them as one rigid body about that
+        top-edge hinge point, reclining the whole module back to MONITOR_TILT_FROM_HORIZONTAL_DEG.
+        Keeping each part's own local geometry vertical, and doing the recline as one pivot on the
+        assembly, keeps the live per-frame text updates (_updateScaleReadout /
+        _updateSceneViewReadout, which only call .SetInput() on the stored text actors) working
+        unchanged.
+
+        Keeps references to the two text actors (_scaleTextActor / _sceneViewTextActor) so they
+        can be updated live. Does NOT spin with the turntable, unlike _tableScreenActor - this is
+        a fixed instrument panel, not decorative table dressing."""
+        halfW = MONITOR_SCREEN_WIDTH_M / 2.0
+        halfH = INFO_SCREEN_HEIGHT_M / 2.0
+        housingHalfW = halfW + MONITOR_BEZEL_MARGIN_M
+        housingHalfH = halfH + MONITOR_BEZEL_MARGIN_M
+
+        hingeX = 0.0
+        hingeY = TABLE_HEIGHT_M
+        hingeZ = TABLE_FORWARD_M + RIM_BAND_RADIUS_M + MONITOR_MOUNT_PROUD_M
+
+        # At-rest (pre-tilt) frame: housing top edge at the hinge, centered on it in X, extending
+        # down into the collar below. The screen face is centered inside the housing (not top-
+        # aligned) so the bezel margin reads evenly on all four sides.
+        housingCenterY = hingeY - housingHalfH
+        housingCenterZ = hingeZ - MONITOR_HOUSING_DEPTH_M / 2.0
+        housingShell = self._boxActor(
+            center=(hingeX, housingCenterY, housingCenterZ),
+            size=(2.0 * housingHalfW, 2.0 * housingHalfH, MONITOR_HOUSING_DEPTH_M),
+            color=RIM_BAND_COLOR)
+
+        centerY = housingCenterY
+        screenZ = hingeZ + MONITOR_SCREEN_PROUD_M
+
+        panelSource = vtk.vtkPlaneSource()
+        panelSource.SetOrigin(-halfW, -halfH, 0.0)
+        panelSource.SetPoint1(halfW, -halfH, 0.0)
+        panelSource.SetPoint2(-halfW, halfH, 0.0)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(panelSource.GetOutputPort())
+        screenFace = vtk.vtkActor()
+        screenFace.SetMapper(mapper)
+        screenFace.SetTexture(self._arrayToTexture(
+            self._signagePanelTexture(borderFrac=INFO_SCREEN_BORDER_FRAC)))
+        screenFace.SetPosition(hingeX, centerY, screenZ)
+        screenProp = screenFace.GetProperty()
+        screenProp.SetColor(1.0, 1.0, 1.0)
+        screenProp.SetAmbient(0.9)
+        screenProp.SetDiffuse(0.1)
+        screenFace.PickableOff()
+
+        # Same bottom-up anchoring as the back-wall panel: scale line sits just inside the top
+        # border, view-name line's bottom lands just inside the bottom border (by construction
+        # of INFO_SCREEN_HEIGHT_M above).
+        interiorHalfH = halfH * (1.0 - 2.0 * INFO_SCREEN_BORDER_FRAC)
+        scaleBottomY = centerY + interiorHalfH - INFO_SCREEN_TEXT_MARGIN_M - INFO_SCREEN_LINE_HEIGHT_M
+        viewBottomY = scaleBottomY - INFO_SCREEN_LINE_GAP_M - INFO_SCREEN_LINE_HEIGHT_M
+        textZ = screenZ + MONITOR_TEXT_PROUD_M  # proud of the screen face
+
+        self._scaleTextActor = self._textActor(
+            position=(hingeX, scaleBottomY, textZ),
+            heightMeters=INFO_SCREEN_LINE_HEIGHT_M, color=ACCENT_COLOR)
+
+        self._sceneViewTextActor = self._textActor(
+            position=(hingeX, viewBottomY, textZ),
+            heightMeters=INFO_SCREEN_LINE_HEIGHT_M, color=(0.75, 0.90, 0.95))
+
+        # Group as one rigid body and pivot about the hinge - see vtkProp3D's Origin/Orientation/
+        # Position composition (Translate(Origin+Position) . Rotate . Scale . Translate(-Origin)):
+        # with Position left at the default, this is exactly the textbook pivot
+        # p' = R(Orientation)*(p - Origin) + Origin, applied uniformly to every part above.
+        assembly = vtk.vtkAssembly()
+        for part in (housingShell, screenFace, self._scaleTextActor, self._sceneViewTextActor):
+            assembly.AddPart(part)
+        assembly.SetOrigin(hingeX, hingeY, hingeZ)
+        # Pivots the whole module back from vertical (facing +Z, standing) to a shallow recline.
+        # Negated: RotateX(+angle) on this local frame swings the screen's normal toward -Y (face
+        # down into the collar) and its far edge backward into the collar's solid body - the
+        # opposite of what we want. RotateX(-angle) swings the normal to (0, cos(tilt), sin(tilt))
+        # - mostly up, partly toward the user - and swings the panel proud of the collar surface
+        # instead of into it.
+        assembly.SetOrientation(-MONITOR_HINGE_ROTATION_DEG, 0.0, 0.0)
+        assembly.PickableOff()
+        return assembly
 
     def _teardownChrome(self) -> None:
         renderer = self._vrRenderer()
@@ -501,6 +864,11 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
                 renderer.RemoveViewProp(prop)
         self._chromeProps = []
         self._scaleTextActor = None
+        self._sceneViewTextActor = None
+        self._tableScreenActor = None
+        self._monitorAssembly = None
+        self._turntableAngleRad = 0.0
+        self._teardownOrientationLabels()
 
     # ------------------------------------------------------------------ lighting
 
@@ -614,23 +982,204 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return actor
 
     @staticmethod
-    def _roomActor():
-        """A large box seen from the inside (front faces culled)."""
+    def _boxActor(center, size, color):
+        """A small solid, flat-shaded box (vtkCubeSource) - used for the monitor housing shell,
+        giving it real 3D bulk rather than reading as a texture decal."""
+        source = vtk.vtkCubeSource()
+        source.SetXLength(size[0])
+        source.SetYLength(size[1])
+        source.SetZLength(size[2])
+        source.SetCenter(center[0], center[1], center[2])
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(source.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetAmbient(0.3)
+        actor.GetProperty().SetDiffuse(0.7)
+        actor.PickableOff()
+        return actor
+
+    @staticmethod
+    def _roomActor(texture):
+        """A large box seen from the inside (front faces culled), wearing a tiled wall-panel
+        texture so the bright steel walls read as paneling rather than flat color."""
         source = vtk.vtkCubeSource()
         source.SetXLength(ROOM_SIZE_M[0])
         source.SetYLength(ROOM_SIZE_M[1])
         source.SetZLength(ROOM_SIZE_M[2])
         source.SetCenter(0.0, ROOM_CENTER_Y_M, 0.0)
+        tile = vtk.vtkTransformTextureCoords()
+        tile.SetInputConnection(source.GetOutputPort())
+        tile.SetScale(10.0, 5.0, 10.0)
         mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(source.GetOutputPort())
+        mapper.SetInputConnection(tile.GetOutputPort())
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(0.12, 0.13, 0.16)
+        actor.SetTexture(texture)
+        actor.GetProperty().SetColor(*WALL_BASE_COLOR)
         actor.GetProperty().FrontfaceCullingOn()
         actor.GetProperty().BackfaceCullingOff()
-        actor.GetProperty().SetAmbient(0.4)
+        actor.GetProperty().SetAmbient(0.5)
+        actor.GetProperty().SetDiffuse(0.5)
         actor.PickableOff()
         return actor
+
+    @staticmethod
+    def _texturedDiscActor(center, radius, texture, innerRadius=0.0, color=(1.0, 1.0, 1.0),
+                            opacity=1.0, ambient=0.6, diffuse=0.4, resolution=64):
+        """A flat disc (normal = +Y, i.e. lying on the floor/table) carrying a planar texture -
+        used for the floor grid and the table's holo-screen inset, which need proper radial UVs
+        that vtkCylinderSource's cap doesn't provide."""
+        source = vtk.vtkDiskSource()
+        source.SetInnerRadius(innerRadius)
+        source.SetOuterRadius(radius)
+        source.SetRadialResolution(1)
+        source.SetCircumferentialResolution(resolution)
+        rotation = vtk.vtkTransform()
+        rotation.RotateX(-90.0)
+        rotate = vtk.vtkTransformPolyDataFilter()
+        rotate.SetTransform(rotation)
+        rotate.SetInputConnection(source.GetOutputPort())
+        tmap = vtk.vtkTextureMapToPlane()
+        tmap.SetInputConnection(rotate.GetOutputPort())
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(tmap.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetTexture(texture)
+        actor.SetPosition(center[0], center[1], center[2])
+        prop = actor.GetProperty()
+        prop.SetColor(*color)
+        prop.SetAmbient(ambient)
+        prop.SetDiffuse(diffuse)
+        prop.SetOpacity(opacity)
+        actor.PickableOff()
+        return actor
+
+    @staticmethod
+    def _glowRingActor(center, innerRadius, outerRadius, color=ACCENT_COLOR, opacity=1.0,
+                        resolution=96):
+        """A flat, self-lit (ambient-only) ring used for neon trim - the table rim and the
+        floor's landing-pad marking. Ambient-only so it reads as glowing rather than shaded,
+        regardless of the room's actual lighting."""
+        source = vtk.vtkDiskSource()
+        source.SetInnerRadius(innerRadius)
+        source.SetOuterRadius(outerRadius)
+        source.SetRadialResolution(1)
+        source.SetCircumferentialResolution(resolution)
+        rotation = vtk.vtkTransform()
+        rotation.RotateX(-90.0)
+        rotate = vtk.vtkTransformPolyDataFilter()
+        rotate.SetTransform(rotation)
+        rotate.SetInputConnection(source.GetOutputPort())
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(rotate.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetPosition(center[0], center[1], center[2])
+        prop = actor.GetProperty()
+        prop.SetColor(*color)
+        prop.SetAmbient(1.0)
+        prop.SetDiffuse(0.0)
+        prop.SetOpacity(opacity)
+        actor.PickableOff()
+        return actor
+
+    @staticmethod
+    def _annulusActor(center, innerRadius, outerRadius, height, color, resolution=64):
+        """A solid ring with a real hole through it (a flat annulus extruded to real thickness) -
+        unlike _discActor's solid disc, this exposes whatever sits underneath through the hole,
+        which is how the table cap gets an actual recessed pocket for the table screen to sit in
+        (a flat disc alone has no way to reveal a lower surface within its own footprint)."""
+        source = vtk.vtkDiskSource()
+        source.SetInnerRadius(innerRadius)
+        source.SetOuterRadius(outerRadius)
+        source.SetRadialResolution(1)
+        source.SetCircumferentialResolution(resolution)
+        rotation = vtk.vtkTransform()
+        rotation.RotateX(-90.0)
+        rotate = vtk.vtkTransformPolyDataFilter()
+        rotate.SetTransform(rotation)
+        rotate.SetInputConnection(source.GetOutputPort())
+        extrude = vtk.vtkLinearExtrusionFilter()
+        extrude.SetInputConnection(rotate.GetOutputPort())
+        extrude.SetExtrusionTypeToVectorExtrusion()
+        extrude.SetVector(0.0, -height, 0.0)  # the disc sits at local y=0; extrude downward
+        extrude.CappingOn()
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(extrude.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetPosition(center[0], center[1], center[2])
+        prop = actor.GetProperty()
+        prop.SetColor(*color)
+        prop.SetAmbient(0.3)
+        prop.SetDiffuse(0.7)
+        actor.PickableOff()
+        return actor
+
+    # ------------------------------------------------------------------ procedural textures
+
+    @staticmethod
+    def _arrayToTexture(rgbArray):
+        """uint8 HxWx3 numpy array -> vtkTexture. Generated once per enter (not per-frame), so
+        plain numpy is fine - no need to hand-roll pixel loops."""
+        height, width, _channels = rgbArray.shape
+        image = vtk.vtkImageData()
+        image.SetDimensions(width, height, 1)
+        # vtkImageData's Y axis runs bottom-to-top; flip so the array reads top-to-bottom as authored.
+        flatRGB = np.flipud(rgbArray).reshape(-1, 3).copy()
+        dataArray = numpy_support.numpy_to_vtk(flatRGB, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
+        image.GetPointData().SetScalars(dataArray)
+        texture = vtk.vtkTexture()
+        texture.SetInputData(image)
+        texture.InterpolateOn()
+        texture.MipmapOn()
+        texture.RepeatOn()
+        return texture
+
+    @staticmethod
+    def _wallPanelTexture(size=256):
+        """Subtle bright panel-line grid for the room walls."""
+        bg = np.array(WALL_BASE_COLOR) * 255.0
+        line = np.array([0.55, 0.75, 0.85]) * 255.0
+        img = np.tile(bg.astype(np.uint8), (size, size, 1))
+        spacing = size // 4
+        for i in range(0, size, spacing):
+            img[max(i - 1, 0):i + 1, :, :] = line.astype(np.uint8)
+            img[:, max(i - 1, 0):i + 1, :] = line.astype(np.uint8)
+        return img
+
+    @staticmethod
+    def _floorPanelTexture(size=512):
+        """Bright steel floor grid, matching the wall paneling."""
+        bg = np.array(FLOOR_BASE_COLOR) * 255.0
+        line = np.array([0.45, 0.55, 0.62]) * 255.0
+        img = np.tile(bg.astype(np.uint8), (size, size, 1))
+        spacing = size // 8
+        for i in range(0, size, spacing):
+            img[max(i - 1, 0):i + 1, :, :] = line.astype(np.uint8)
+            img[:, max(i - 1, 0):i + 1, :] = line.astype(np.uint8)
+        return img
+
+    @staticmethod
+    def _tableScreenTexture(size=512):
+        """Concentric rings + radial spokes on a dark background - a circuit/targeting-pad look
+        for the holo-readout inset in the tabletop. Uses the dim accent (not the full-bright
+        ACCENT_COLOR) so the pattern stays legible without the table reading as a wash of blue."""
+        bg = np.array(TABLE_SCREEN_BG_COLOR) * 255.0
+        ring = np.array(ACCENT_COLOR_DIM) * 255.0
+        img = np.tile(bg.astype(np.uint8), (size, size, 1))
+        yy, xx = np.mgrid[0:size, 0:size]
+        cx = cy = (size - 1) / 2.0
+        r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / (size / 2.0)
+        theta = np.arctan2(yy - cy, xx - cx)
+        ringMask = (np.abs(np.sin(r * math.pi * 6.0)) > 0.97) & (r < 0.96)
+        spokeMask = (np.abs(np.sin(theta * 8.0)) < 0.02) & (r > 0.12) & (r < 0.96)
+        edgeMask = (r > 0.93) & (r < 0.97)
+        img[ringMask | spokeMask | edgeMask] = ring.astype(np.uint8)
+        return img
 
     @staticmethod
     def _textActor(position, heightMeters, color=(0.9, 0.95, 1.0)):
@@ -653,8 +1202,120 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         # including the built-in A+X gesture - not just our +/- steps.
         self._magnification = self._currentMagnification()
         if self._scaleTextActor is not None:
+            # No "Scale:" label - the info screen is small and its position (on the table) and
+            # the scene-view name right below it already make it obvious what the number means.
             self._scaleTextActor.SetInput(
-                _("Scale: {scale:.2f}x").format(scale=self._magnification))
+                _("{scale:.2f}x").format(scale=self._magnification))
+
+    def _updateSceneViewReadout(self) -> None:
+        """Show the current scene view's name on the info screen (or a placeholder before the
+        user has cycled to one - see _sceneViewIndex). Scene view names are free text the user
+        entered elsewhere, so they're truncated to keep the info screen a fixed, bounded size."""
+        if self._sceneViewTextActor is None:
+            return
+        logic = self._sceneViewsLogic()
+        name = None
+        if logic is not None and 0 <= self._sceneViewIndex < logic.GetNumberOfSceneViews():
+            name = logic.GetNthSceneViewName(self._sceneViewIndex)
+        if not name:
+            self._sceneViewTextActor.SetInput(_("(live scene)"))
+            return
+        if len(name) > INFO_SCREEN_NAME_MAX_CHARS:
+            name = name[:INFO_SCREEN_NAME_MAX_CHARS - 1] + "…"
+        self._sceneViewTextActor.SetInput(name)
+
+    def _updateTableScreenOrientation(self) -> None:
+        """Spin the table screen's own texture by the accumulated turntable angle, on top of
+        the shared anchorMatrix that otherwise keeps all chrome screen-fixed - see
+        rotateTurntable/_turntableAngleRad. Only the left-stick/auto-spin turntable control
+        drives this, not the built-in two-controller free move/rotate/scale gesture."""
+        if self._tableScreenActor is not None:
+            angleDeg = vtk.vtkMath.DegreesFromRadians(self._turntableAngleRad)
+            self._tableScreenActor.SetOrientation(0.0, angleDeg, 0.0)
+
+    # ------------------------------------------------------------------ orientation labels
+    #
+    # R/L/A/P/S/I are authored directly in RAS/world coordinates (no UserMatrix), exactly like
+    # the actual MRML data. Per computePhysicalToWorld's derivation, real MRML data never
+    # actually moves in world space - what changes is the PhysicalToWorldMatrix used to view it,
+    # which makes it *appear* transformed by W. Anything else authored in raw world coordinates
+    # (with no UserMatrix override) appears to move by that same W, so these labels track the
+    # anatomy's apparent rotation/placement automatically, with no extra code needed when the
+    # table spins or scales. Contrast with _chromeProps, which use UserMatrix=_anchorMatrix so
+    # they stay room-fixed instead.
+
+    @staticmethod
+    def _billboardTextActor(text, color=ACCENT_COLOR, fontSize=ORIENTATION_LABEL_FONT_SIZE):
+        """A camera-facing, constant-screen-size 3D label anchored at a world/RAS point."""
+        actor = vtk.vtkBillboardTextActor3D()
+        actor.SetInput(text)
+        tprop = actor.GetTextProperty()
+        tprop.SetFontSize(fontSize)
+        tprop.SetColor(*color)
+        tprop.SetBold(True)
+        tprop.SetJustificationToCentered()
+        tprop.SetVerticalJustificationToCentered()
+        tprop.ShadowOn()
+        tprop.SetFrameWidth(2)
+        actor.PickableOff()
+
+        # The internal textured quad is lit by default, which tints the label
+        # under Slicer's default light kit. Reach it via GetActors() and unlit it.
+        props = vtk.vtkPropCollection()
+        actor.GetActors(props)
+        quad = props.GetLastProp()
+        if quad is not None:
+            quad.GetProperty().LightingOff()
+
+        return actor
+
+    def _buildOrientationLabels(self, renderer) -> None:
+        self._orientationLabelActors = {}
+        for letter in ORIENTATION_LABEL_AXES:
+            actor = self._billboardTextActor(letter)
+            renderer.AddViewProp(actor)  # no UserMatrix: authored directly in RAS/world
+            self._orientationLabelActors[letter] = actor
+        self._updateOrientationLabels()
+
+    def _teardownOrientationLabels(self) -> None:
+        renderer = self._vrRenderer()
+        if renderer is not None:
+            for actor in self._orientationLabelActors.values():
+                renderer.RemoveViewProp(actor)
+        self._orientationLabelActors = {}
+
+    def _updateOrientationLabels(self) -> None:
+        """Reposition the R/L/A/P/S/I labels around the current data bounds/center. Called
+        whenever the data set changes (_recomputeDataBounds); rotation/scale need no separate
+        update here since the labels are RAS-anchored (see class comment above).
+
+        All six sit the same small margin outside the data's bounds along their own axis. This
+        used to plant I below the table surface, because the data's bottom rested exactly on
+        it (zero gap) - fixed by lifting the whole anatomy off the table instead (see
+        TABLE_LIFT_BUFFER_MM in computePhysicalToWorld), not by treating I specially here.
+        """
+        if not self._orientationLabelActors:
+            return
+        bounds = self._dataBounds
+        center = self._dataCenter
+        radiusXY = 0.5 * max(
+            self._extentAlongAxis(bounds, (1.0, 0.0, 0.0)),
+            self._extentAlongAxis(bounds, (0.0, 1.0, 0.0)))
+        radiusZ = 0.5 * self._extentAlongAxis(bounds, (0.0, 0.0, 1.0))
+        if radiusXY <= 0.0 and radiusZ <= 0.0:
+            radiusXY = radiusZ = ORIENTATION_LABEL_DEFAULT_RADIUS_MM
+        else:
+            radiusXY += ORIENTATION_LABEL_MARGIN_MM
+            radiusZ += ORIENTATION_LABEL_MARGIN_MM
+        for letter, axis in ORIENTATION_LABEL_AXES.items():
+            actor = self._orientationLabelActors.get(letter)
+            if actor is None:
+                continue
+            radius = radiusZ if axis[2] != 0.0 else radiusXY
+            actor.SetPosition(
+                center[0] + axis[0] * radius,
+                center[1] + axis[1] * radius,
+                center[2] + axis[2] * radius)
 
     # ------------------------------------------------------------------ VR world transform
 
@@ -739,9 +1400,12 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         tableWorld = list(baseMatrix.MultiplyPoint(
             [tablePhysical[0], tablePhysical[1], tablePhysical[2], 1.0]))[:3]
 
-        # Rest the data's bottom on the table: lift the center by half the (scaled) height.
+        # Float the data just above the table: lift the center by half the (scaled) height, plus
+        # a small fixed clearance (TABLE_LIFT_BUFFER_MM, scaled the same way) so the data doesn't
+        # sit flush against the table surface.
         halfHeight = 0.5 * VRViewerLogic._extentAlongAxis(dataBounds, up) * relScale
-        target = [tableWorld[i] + up[i] * halfHeight for i in range(3)]
+        liftBuffer = TABLE_LIFT_BUFFER_MM * relScale
+        target = [tableWorld[i] + up[i] * (halfHeight + liftBuffer) for i in range(3)]
 
         w = vtk.vtkTransform()
         w.PostMultiply()
@@ -819,6 +1483,8 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         matrix = self.computePhysicalToWorld(
             self._basePhysicalToWorld, self._fitRelScale, 0.0, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
         self._setPhysicalToWorld(matrix)
+        self._turntableAngleRad = 0.0
+        self._updateTableScreenOrientation()
         self._updateScaleReadout()
 
     def _resetFraming(self) -> None:
@@ -885,6 +1551,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         dataNodes = self._collectVisibleDataNodes()
         self._dataBounds = self._combinedRASBounds(dataNodes)
         self._dataCenter = self._combinedRASCenter(dataNodes)
+        self._updateOrientationLabels()
 
     @staticmethod
     def _collectVisibleDataNodes():
@@ -956,6 +1623,8 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         w = vtk.vtkMatrix4x4()
         t.GetMatrix(w)
         self._incrementalWorldTransform(w)
+        self._turntableAngleRad += deltaRad
+        self._updateTableScreenOrientation()
 
     def toggleAutoSpin(self) -> None:
         """Left menu button: hands-free presentation rotation (paused while the user drives
@@ -1082,6 +1751,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._sceneViewIndex = (self._sceneViewIndex + (1 if direction > 0 else -1)) % count
         logic.RestoreSceneView(self._sceneViewIndex)
         self._resetFraming()
+        self._updateSceneViewReadout()
 
     # ------------------------------------------------------------------ controller observers
 
@@ -1238,14 +1908,17 @@ class VRViewerTest(ScriptedLoadableModuleTest):
         self.assertEqual(logic.steppedMagnification(MAX_MAGNIFICATION, +1, 2.0), MAX_MAGNIFICATION)
         self.assertEqual(logic.steppedMagnification(MIN_MAGNIFICATION, -1, 2.0), MIN_MAGNIFICATION)
 
-        # With M0 = identity and relScale 1, the data center appears at the table location:
-        # M maps the table physical point onto the data center (zero-extent data).
+        # With M0 = identity and relScale 1, the data center appears TABLE_LIFT_BUFFER_MM above
+        # the table location along "up" (zero-extent data, so that's the only offset): M maps
+        # the table physical point onto dataCenter - up*liftBuffer.
         identity = vtk.vtkMatrix4x4()
         dataCenter = [10.0, 20.0, 30.0]
         emptyBounds = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]  # extent 0
         m = logic.computePhysicalToWorld(identity, 1.0, 0.0, emptyBounds, dataCenter, TABLE_PHYSICAL)
         mapped = m.MultiplyPoint([TABLE_PHYSICAL[0], TABLE_PHYSICAL[1], TABLE_PHYSICAL[2], 1.0])
+        up = VRViewerLogic._worldUp(identity)
+        expected = [dataCenter[a] - up[a] * TABLE_LIFT_BUFFER_MM for a in range(3)]
         for a in range(3):
-            self.assertAlmostEqual(mapped[a], dataCenter[a], places=4)
+            self.assertAlmostEqual(mapped[a], expected[a], places=4)
 
         self.delayDisplay("Test passed")
