@@ -1,4 +1,5 @@
 import logging
+import math
 from typing import Annotated
 
 import vtk
@@ -73,13 +74,16 @@ class VRViewerParameterNode:
     fitToTable - if true, auto-scale each framing so the data spans the table. Off by default:
         with it on, different scene views (with different data extents) land at very different
         scales; off, every framing uses the same real-world scale (1.0 = normal VR size).
+    overheadLight - if true, the table is lit by a light rig anchored above it (with softer
+        fill lights derived from it) instead of the VR view's default lighting.
     """
 
-    rotationSpeedDegPerSec: Annotated[float, WithinRange(1.0, 360.0)] = 45.0
+    rotationSpeedDegPerSec: Annotated[float, WithinRange(1.0, 360.0)] = 180.0
     magnificationStep: Annotated[float, WithinRange(1.01, 4.0)] = 1.25
     includeSlices: bool = True
     showRoom: bool = True
     fitToTable: bool = False
+    overheadLight: bool = True
 
 
 #
@@ -197,9 +201,32 @@ ROOM_SIZE_M = (6.0, 3.0, 6.0)   # width (X), height (Y), depth (Z)
 ROOM_CENTER_Y_M = 1.5
 SCALE_TEXT_HEIGHT_M = 0.04
 
-# Physical "up" direction and the physical point the data center is placed at (table top).
-PHYSICAL_UP = (0.0, 1.0, 0.0)
+# The physical point the data center is placed at (table top), and the physical "up" direction
+# (true gravity) - the room chrome (floor/table/walls) is authored directly in physical meters
+# along this axis and is therefore always level, however the world is currently oriented.
 TABLE_PHYSICAL = (0.0, TABLE_HEIGHT_M + TABLE_TOP_THICKNESS_M, TABLE_FORWARD_M)
+PHYSICAL_UP = (0.0, 1.0, 0.0)
+
+# World "up" (RAS Superior) that _alignedBaseMatrix calibrates the reference matrix (M0) to at
+# entry, so the data starts out standing upright on the table. _worldUp() re-derives the actual
+# current world-space up from whichever matrix it's given, falling back to this constant only in
+# the degenerate case - see _worldUp for why a live re-derivation (rather than trusting this
+# constant everywhere) matters once the built-in free-move/rotate/scale gesture is used.
+WORLD_UP_RAS = (0.0, 0.0, 1.0)
+
+# Overhead light rig (authored in physical meters, anchored to the room like the chrome).
+# The key light hangs near the ceiling above the table, mostly illuminating the top of the
+# data; on its own a light straight down grazes vertical/side surfaces at a shallow, nearly
+# azimuth-independent angle, leaving a large dim band around the sides no matter how the data
+# is rotated on the turntable. The fill lights sit lower (near chest height) and spread evenly
+# around the table so every side gets real coverage from at least one of them.
+OVERHEAD_LIGHT_HEIGHT_M = ROOM_SIZE_M[1] - 0.2
+OVERHEAD_LIGHT_COLOR = (1.0, 0.97, 0.92)  # warm white
+OVERHEAD_LIGHT_INTENSITY = 0.9
+FILL_LIGHT_HEIGHT_M = TABLE_HEIGHT_M + 0.5
+FILL_LIGHT_RADIUS_M = 1.3                  # horizontal distance from the table center
+FILL_LIGHT_ANGLES_DEG = (60.0, 180.0, 300.0)  # evenly spaced (120 degrees apart) around the table
+FILL_LIGHT_INTENSITY_FACTOR = 0.6  # fraction of the key light's intensity, applied to each fill
 
 MIN_MAGNIFICATION = 0.01
 MAX_MAGNIFICATION = 100.0
@@ -244,6 +271,12 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._chromeProps = []
         self._scaleTextActor = None
         self._anchorMatrix = vtk.vtkMatrix4x4()
+
+        # Overhead light rig, anchored to physical space the same way as the chrome. When
+        # active it replaces the VR view's default lights (captured/detached in
+        # _defaultLights) so the table reads as lit from the room's overhead fixture.
+        self._overheadLights = []
+        self._defaultLights = []  # [light, ...] - detached from the renderer while active
 
         # VR framing state. The base matrix is captured on entry (the reference view Slicer
         # establishes) and everything is expressed relative to it, so the data keeps Slicer's
@@ -347,10 +380,14 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
         # Let the VR view establish its reference-view framing, then capture it as our base.
         slicer.app.processEvents()
-        self._basePhysicalToWorld = vtk.vtkMatrix4x4()
-        widget.renderWindow().GetPhysicalToWorldMatrix(self._basePhysicalToWorld)
+        capturedPhysicalToWorld = vtk.vtkMatrix4x4()
+        widget.renderWindow().GetPhysicalToWorldMatrix(capturedPhysicalToWorld)
         self._savedPhysicalToWorld = vtk.vtkMatrix4x4()
-        self._savedPhysicalToWorld.DeepCopy(self._basePhysicalToWorld)
+        self._savedPhysicalToWorld.DeepCopy(capturedPhysicalToWorld)
+        # Our base (M0) is re-oriented so physical up maps exactly onto WORLD_UP_RAS - see
+        # _alignedBaseMatrix. The saved matrix above is left untouched (the real reference-view
+        # framing) so exiting restores the VR view exactly as SlicerVR set it up.
+        self._basePhysicalToWorld = self._alignedBaseMatrix(capturedPhysicalToWorld)
 
         self._magnification = DEFAULT_MAGNIFICATION
         self._activeSliceIndex = 0
@@ -359,6 +396,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._rightStickY = 0.0
 
         self._buildChrome(renderer)
+        self._buildLighting(renderer)
         self._resetFraming()
 
         # Show/hide the slice planes on entry per the option.
@@ -399,6 +437,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._savedGrab = None
 
         self._teardownChrome()
+        self._teardownLighting()
 
         self._basePhysicalToWorld = None
         self._savedPhysicalToWorld = None
@@ -408,8 +447,10 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
     def applyOptions(self) -> None:
         """Re-read options that can change live. Rotation speed / scale step are read on demand;
-        showRoom / includeSlices take effect on the next enter."""
-        return
+        overheadLight is applied immediately; showRoom / includeSlices take effect on the next
+        enter."""
+        if self.isActive:
+            self._applyLightingOption()
 
     # ------------------------------------------------------------------ chrome
 
@@ -460,6 +501,99 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
                 renderer.RemoveViewProp(prop)
         self._chromeProps = []
         self._scaleTextActor = None
+
+    # ------------------------------------------------------------------ lighting
+
+    def _buildLighting(self, renderer) -> None:
+        """Build the overhead-anchored light rig and record the renderer's current (default)
+        lights so they can be detached/restored. The rig is anchored to physical space via
+        _anchorMatrix, exactly like the chrome props, so it stays fixed over the table
+        regardless of framing/gesture - see _applyLightingOption for why the default lights
+        need to be fully removed, not just switched off, while it's active."""
+        self._defaultLights = []
+        lights = renderer.GetLights()
+        if lights is not None:
+            lights.InitTraversal()
+            light = lights.GetNextItem()
+            while light is not None:
+                self._defaultLights.append(light)
+                light = lights.GetNextItem()
+
+        keyPosition = (0.0, OVERHEAD_LIGHT_HEIGHT_M, TABLE_FORWARD_M)
+        key = self._physicalLight(
+            position=keyPosition, focalPoint=TABLE_PHYSICAL,
+            color=OVERHEAD_LIGHT_COLOR, intensity=OVERHEAD_LIGHT_INTENSITY)
+
+        self._overheadLights = [key]
+        for angleDeg in FILL_LIGHT_ANGLES_DEG:
+            angleRad = math.radians(angleDeg)
+            fillPosition = (
+                TABLE_PHYSICAL[0] + FILL_LIGHT_RADIUS_M * math.sin(angleRad),
+                FILL_LIGHT_HEIGHT_M,
+                TABLE_PHYSICAL[2] + FILL_LIGHT_RADIUS_M * math.cos(angleRad))
+            self._overheadLights.append(self._physicalLight(
+                position=fillPosition, focalPoint=TABLE_PHYSICAL,
+                color=OVERHEAD_LIGHT_COLOR, intensity=OVERHEAD_LIGHT_INTENSITY * FILL_LIGHT_INTENSITY_FACTOR))
+
+        for light in self._overheadLights:
+            light.SetTransformMatrix(self._anchorMatrix)  # shared matrix, updated by _reanchorChrome
+            renderer.AddLight(light)
+
+        self._applyLightingOption()
+
+    def _teardownLighting(self) -> None:
+        renderer = self._vrRenderer()
+        if renderer is not None:
+            for light in self._overheadLights:
+                renderer.RemoveLight(light)
+            liveLights = renderer.GetLights()
+            for light in self._defaultLights:
+                if liveLights.IsItemPresent(light) == 0:
+                    renderer.AddLight(light)
+        self._overheadLights = []
+        self._defaultLights = []
+
+    def _applyLightingOption(self) -> None:
+        """Live-toggle between the overhead rig and the VR view's default lights.
+
+        The default lights are fully detached from the renderer (not just switched off) while
+        the overhead rig is active, rather than relying on vtkLight::Switch. They're positioned
+        directly in world/RAS coordinates with no TransformMatrix, unlike our rig and the room
+        chrome, which are both anchored to physical space so they stay visually fixed on screen
+        as the world rotates (their world position moves with the current PhysicalToWorldMatrix,
+        which exactly cancels out when the camera view is computed). The default lights don't
+        get that compensation, so as the turntable rotates the world their apparent direction
+        relative to the viewer keeps changing - visible as light shifting across the (otherwise
+        static) room walls/ceiling. Some other code can also flip Switch back on for one of them
+        independently of us, which a Switch-only toggle here wouldn't survive.
+        """
+        renderer = self._vrRenderer()
+        if renderer is None:
+            return
+        enabled = self.getParameterNode().overheadLight
+        for light in self._overheadLights:
+            light.SetSwitch(enabled)
+        liveLights = renderer.GetLights()
+        for light in self._defaultLights:
+            isPresent = liveLights.IsItemPresent(light) != 0
+            if enabled and isPresent:
+                renderer.RemoveLight(light)
+            elif not enabled and not isPresent:
+                renderer.AddLight(light)
+
+    @staticmethod
+    def _physicalLight(position, focalPoint, color, intensity):
+        """A directional (non-positional) light authored in physical meters; direction is
+        Position -> FocalPoint, brightness independent of distance so it is unaffected by the
+        world scale applied via PhysicalToWorldMatrix."""
+        light = vtk.vtkLight()
+        light.SetLightTypeToSceneLight()
+        light.SetPositional(False)
+        light.SetPosition(*position)
+        light.SetFocalPoint(*focalPoint)
+        light.SetColor(*color)
+        light.SetIntensity(intensity)
+        return light
 
     @staticmethod
     def _discActor(center, radius, height, color):
@@ -537,6 +671,56 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return max(projections) - min(projections)
 
     @staticmethod
+    def _alignedBaseMatrix(baseMatrix):
+        """Pure helper (headless-testable). Rotate the captured reference matrix (M0) about its
+        own origin so that physical up (true gravity - what the room chrome and camera are
+        always consistently anchored to, see _reanchorChrome) maps exactly onto WORLD_UP_RAS.
+
+        This just sets the data's *starting* orientation (Superior pointing at the ceiling);
+        _worldUp() re-derives the actual axis afterwards on every rotate/scale, so this
+        alignment isn't required for correctness, only so the data starts upright.
+        """
+        physicalUp = list(baseMatrix.MultiplyPoint([0.0, 1.0, 0.0, 0.0]))[:3]
+        norm = vtk.vtkMath.Norm(physicalUp)
+        if norm < 1e-9:
+            return baseMatrix
+        physicalUp = [c / norm for c in physicalUp]
+
+        target = list(WORLD_UP_RAS)
+        axis = [0.0, 0.0, 0.0]
+        vtk.vtkMath.Cross(physicalUp, target, axis)
+        axisNorm = vtk.vtkMath.Norm(axis)
+        if axisNorm < 1e-9:
+            # Already aligned (or exactly opposed, an unrecoverable degenerate case) - leave as-is.
+            return baseMatrix
+        axis = [c / axisNorm for c in axis]
+        angleDeg = vtk.vtkMath.DegreesFromRadians(vtk.vtkMath.AngleBetweenVectors(physicalUp, target))
+
+        rotation = vtk.vtkTransform()
+        rotation.RotateWXYZ(angleDeg, axis[0], axis[1], axis[2])
+        rotationMatrix = vtk.vtkMatrix4x4()
+        rotation.GetMatrix(rotationMatrix)
+
+        corrected = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Multiply4x4(rotationMatrix, baseMatrix, corrected)
+        for i in range(3):
+            corrected.SetElement(i, 3, baseMatrix.GetElement(i, 3))  # keep the reference position
+        return corrected
+
+    @staticmethod
+    def _worldUp(matrix):
+        """The world/RAS direction that `matrix` currently maps physical up (true gravity) to -
+        i.e. the table's actual current normal. Re-deriving this from whatever matrix is live
+        (rather than trusting a fixed constant) matters because the built-in two-controller
+        free move/rotate/scale gesture can tilt the world by an arbitrary amount, outside of
+        our own controls; using a stale fixed axis after that would spin/orient the data about
+        an axis no longer perpendicular to the table, causing a wobble. Falls back to
+        WORLD_UP_RAS in the degenerate (zero-length) case."""
+        up = list(matrix.MultiplyPoint([PHYSICAL_UP[0], PHYSICAL_UP[1], PHYSICAL_UP[2], 0.0]))[:3]
+        norm = vtk.vtkMath.Norm(up)
+        return [c / norm for c in up] if norm > 1e-9 else list(WORLD_UP_RAS)
+
+    @staticmethod
     def computePhysicalToWorld(baseMatrix, relScale, angleRad, dataBounds, dataCenter, tablePhysical):
         """Pure helper (headless-testable). Build the VR PhysicalToWorldMatrix that makes the
         data appear placed on the table, scaled by world factor `relScale`, and spun by
@@ -551,9 +735,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         chrome (anchored with UserMatrix = M) stays put while the data moves.
         """
         # World "up" and the world point at the table location, both derived from M0.
-        up = list(baseMatrix.MultiplyPoint([PHYSICAL_UP[0], PHYSICAL_UP[1], PHYSICAL_UP[2], 0.0]))[:3]
-        norm = vtk.vtkMath.Norm(up)
-        up = [c / norm for c in up] if norm > 1e-9 else [0.0, 0.0, 1.0]
+        up = VRViewerLogic._worldUp(baseMatrix)
         tableWorld = list(baseMatrix.MultiplyPoint(
             [tablePhysical[0], tablePhysical[1], tablePhysical[2], 1.0]))[:3]
 
@@ -663,10 +845,10 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
     def _tableAxle(self, matrix):
         """(worldUp unit vector, table-center world point) for the given PTW matrix - the
-        vertical axle the turntable spins/scales about, fixed at the room's table location."""
-        up = list(matrix.MultiplyPoint([PHYSICAL_UP[0], PHYSICAL_UP[1], PHYSICAL_UP[2], 0.0]))[:3]
-        norm = vtk.vtkMath.Norm(up)
-        up = [c / norm for c in up] if norm > 1e-9 else [0.0, 0.0, 1.0]
+        vertical axle the turntable spins/scales about, fixed at the room's table location.
+        `up` is re-derived from `matrix` (see _worldUp) so it stays aligned with the table's
+        actual current normal even after the free move/rotate/scale gesture tilts the world."""
+        up = self._worldUp(matrix)
         axle = list(matrix.MultiplyPoint([TABLE_PHYSICAL[0], TABLE_PHYSICAL[1], TABLE_PHYSICAL[2], 1.0]))[:3]
         return up, axle
 

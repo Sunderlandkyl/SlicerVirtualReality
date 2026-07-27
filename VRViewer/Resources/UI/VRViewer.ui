@@ -163,6 +163,22 @@
         </property>
        </widget>
       </item>
+      <item row="5" column="0" colspan="2">
+       <widget class="QCheckBox" name="overheadLightCheckBox">
+        <property name="toolTip">
+         <string>Light the table from an overhead fixture near the ceiling, with softer fill lights derived from it, instead of the VR view's default lighting.</string>
+        </property>
+        <property name="text">
+         <string>Overhead light</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>overheadLight</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
