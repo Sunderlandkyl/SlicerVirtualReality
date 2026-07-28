@@ -278,17 +278,20 @@ HELP_PANEL_HEIGHT_M = _HELP_CONTENT_HEIGHT_M / (1.0 - 2.0 * HELP_PANEL_BORDER_FR
 # on the monitor housing built into the table's collar (see MONITOR_* below). Text layout is
 # unchanged from the module's original standing-sign design - only the housing/mounting geometry
 # around it changed.
-INFO_SCREEN_LINE_HEIGHT_M = 0.035
+INFO_SCREEN_LINE_HEIGHT_M = 0.035    # the scale readout ("1.00x") - short, room to stay large
 INFO_SCREEN_LINE_GAP_M = 0.015
 INFO_SCREEN_TEXT_MARGIN_M = 0.02
 INFO_SCREEN_BORDER_FRAC = 0.05    # must match _signagePanelTexture's default borderFrac
-# Scene view names are free text; truncated (with an ellipsis) so the panel width stays bounded
-# even against a worst-case string of wide capital letters (checked headlessly), not just typical
-# mixed-case names.
-INFO_SCREEN_NAME_MAX_CHARS = 12
+# The scene-view name gets its own (smaller) line height, distinct from the scale line above it:
+# on the monitor's narrower MONITOR_SCREEN_WIDTH_M, the old shared size overflowed the screen's
+# edges for long names. Truncation (see _fitNameToScreenWidth / INFO_SCREEN_NAME_MAX_WIDTH_M
+# below, once MONITOR_SCREEN_WIDTH_M is defined) is based on each name's actual rendered width,
+# not a fixed character count - a fixed count either truncated ordinary short names that had
+# plenty of room left, or would still overflow on unusually wide ones.
+INFO_SCREEN_NAME_LINE_HEIGHT_M = 0.0105
 
-_INFO_SCREEN_CONTENT_HEIGHT_M = (2.0 * INFO_SCREEN_TEXT_MARGIN_M + 2.0 * INFO_SCREEN_LINE_HEIGHT_M
-                                  + INFO_SCREEN_LINE_GAP_M)
+_INFO_SCREEN_CONTENT_HEIGHT_M = (2.0 * INFO_SCREEN_TEXT_MARGIN_M + INFO_SCREEN_LINE_HEIGHT_M
+                                  + INFO_SCREEN_NAME_LINE_HEIGHT_M + INFO_SCREEN_LINE_GAP_M)
 INFO_SCREEN_HEIGHT_M = _INFO_SCREEN_CONTENT_HEIGHT_M / (1.0 - 2.0 * INFO_SCREEN_BORDER_FRAC)
 
 # Monitor housing: a physically-modeled screen module (housing shell + textured screen face +
@@ -297,6 +300,12 @@ INFO_SCREEN_HEIGHT_M = _INFO_SCREEN_CONTENT_HEIGHT_M / (1.0 - 2.0 * INFO_SCREEN_
 # table. See _buildMonitorAssembly.
 MONITOR_SCREEN_WIDTH_M = 0.24        # narrower than the old standing sign - reads as one
                                        # embedded module now, not a sign
+# The scene-view name is truncated to whatever actually fits this width (see
+# _fitNameToScreenWidth), measured via the live text actor's own rendered bounds rather than a
+# fixed character count - matches the screen's interior width, i.e. inside both the texture's
+# baked border and the same text margin used for the vertical layout above.
+INFO_SCREEN_NAME_MAX_WIDTH_M = (MONITOR_SCREEN_WIDTH_M * (1.0 - 2.0 * INFO_SCREEN_BORDER_FRAC)
+                                  - 2.0 * INFO_SCREEN_TEXT_MARGIN_M)
 MONITOR_BEZEL_MARGIN_M = 0.025       # housing overhang beyond the screen face, per side
 MONITOR_HOUSING_DEPTH_M = 0.05
 MONITOR_SCREEN_PROUD_M = 0.006       # screen face proud of the housing shell's front face
@@ -359,6 +368,14 @@ FILL_LIGHT_HEIGHT_M = TABLE_HEIGHT_M + 0.5
 FILL_LIGHT_RADIUS_M = 1.3                  # horizontal distance from the table center
 FILL_LIGHT_ANGLES_DEG = (60.0, 180.0, 300.0)  # evenly spaced (120 degrees apart) around the table
 FILL_LIGHT_INTENSITY_FACTOR = 0.6  # fraction of the key light's intensity, applied to each fill
+
+# Ceiling light panels: a purely visual fixture (baked emissive texture, casts no actual light
+# of its own) mounted just below the room's ceiling so the overhead rig above has a visible
+# source, rather than the room appearing lit from nowhere. Only relevant when showRoom is set,
+# since without walls there's no ceiling surface for it to read as being mounted into.
+CEILING_LIGHT_OFFSET_M = 0.01   # just inside the room cube's inner ceiling surface, avoids z-fighting
+CEILING_PANEL_BG_COLOR = COLUMN_COLOR
+CEILING_LIGHT_EMISSIVE_FACTOR = (1.0, 1.0, 1.0)
 
 MIN_MAGNIFICATION = 0.01
 MAX_MAGNIFICATION = 100.0
@@ -645,11 +662,16 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             innerRadius=tableScreenRadius, outerRadius=TABLE_RADIUS_M,
             height=TABLE_TOP_THICKNESS_M, color=TABLE_RING_COLOR)
         tableTopRing.GetProperty().SetMetallic(1.0)
+        tableTopRing.GetProperty().SetRoughness(0.2)  # mirror-like, since it's the cap's top
+        tableTopRing.GetProperty().SetSpecular(0.5)
+        tableTopRing.GetProperty().SetInterpolationToPBR()
         wellFloorHeight = TABLE_TOP_THICKNESS_M - TABLE_SCREEN_RECESS_DEPTH_M
         tableWellFloor = self._discActor(
             center=(0.0, TABLE_HEIGHT_M + wellFloorHeight / 2.0, TABLE_FORWARD_M),
             radius=tableScreenRadius, height=wellFloorHeight, color=TABLE_RING_COLOR)
         tableWellFloor.GetProperty().SetMetallic(1.0)
+        tableWellFloor.GetProperty().SetRoughness(0.5)  # less mirror than the cap's ring
+        tableWellFloor.GetProperty().SetInterpolationToPBR()
         tableScreenTexture = self._arrayToTexture(self._tableScreenTexture())
         self._tableScreenActor = self._texturedDiscActor(
             center=(tableCenterXZ[0], TABLE_HEIGHT_M + wellFloorHeight + 0.002, tableCenterXZ[1]),
@@ -684,6 +706,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
         if params.showRoom:
             self._chromeProps.append(self._roomActor(self._arrayToTexture(self._wallPanelTexture())))
+            self._chromeProps.append(self._ceilingLightActor())
             self._chromeProps.extend(self._backWallSignageActors())
 
         self._monitorAssembly = self._buildMonitorAssembly()
@@ -828,7 +851,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         # of INFO_SCREEN_HEIGHT_M above).
         interiorHalfH = halfH * (1.0 - 2.0 * INFO_SCREEN_BORDER_FRAC)
         scaleBottomY = centerY + interiorHalfH - INFO_SCREEN_TEXT_MARGIN_M - INFO_SCREEN_LINE_HEIGHT_M
-        viewBottomY = scaleBottomY - INFO_SCREEN_LINE_GAP_M - INFO_SCREEN_LINE_HEIGHT_M
+        viewBottomY = scaleBottomY - INFO_SCREEN_LINE_GAP_M - INFO_SCREEN_NAME_LINE_HEIGHT_M
         textZ = screenZ + MONITOR_TEXT_PROUD_M  # proud of the screen face
 
         self._scaleTextActor = self._textActor(
@@ -837,7 +860,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
         self._sceneViewTextActor = self._textActor(
             position=(hingeX, viewBottomY, textZ),
-            heightMeters=INFO_SCREEN_LINE_HEIGHT_M, color=(0.75, 0.90, 0.95))
+            heightMeters=INFO_SCREEN_NAME_LINE_HEIGHT_M, color=(0.75, 0.90, 0.95))
 
         # Group as one rigid body and pivot about the hinge - see vtkProp3D's Origin/Orientation/
         # Position composition (Translate(Origin+Position) . Rotate . Scale . Translate(-Origin)):
@@ -1025,6 +1048,33 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         actor.PickableOff()
         return actor
 
+    @classmethod
+    def _ceilingLightActor(cls):
+        """A flat panel mounted just below the ceiling, textured with a grid of bright
+        fixtures (see _ceilingPanelTexture) and fed to the PBR emissive pipeline exactly like
+        _tableScreenActor - gives the overhead light rig (_physicalLight) a visible source
+        instead of the room appearing lit from nowhere. Purely cosmetic: it casts no light of
+        its own, the actual illumination comes from the vtkLight rig built separately."""
+        halfWidth, halfDepth = ROOM_SIZE_M[0] / 2.0, ROOM_SIZE_M[2] / 2.0
+        y = ROOM_SIZE_M[1] - CEILING_LIGHT_OFFSET_M
+        source = vtk.vtkPlaneSource()
+        source.SetOrigin(-halfWidth, y, halfDepth)
+        source.SetPoint1(halfWidth, y, halfDepth)
+        source.SetPoint2(-halfWidth, y, -halfDepth)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(source.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        texture = cls._arrayToTexture(cls._ceilingPanelTexture())
+        texture.UseSRGBColorSpaceOn()  # required for albedo/emissive textures
+        prop = actor.GetProperty()
+        prop.SetInterpolationToPBR()
+        prop.SetBaseColorTexture(texture)
+        prop.SetEmissiveTexture(texture)
+        prop.SetEmissiveFactor(*CEILING_LIGHT_EMISSIVE_FACTOR)
+        actor.PickableOff()
+        return actor
+
     @staticmethod
     def _texturedDiscActor(center, radius, texture, innerRadius=0.0, color=(1.0, 1.0, 1.0),
                             opacity=1.0, ambient=0.6, diffuse=0.4, resolution=64):
@@ -1164,6 +1214,25 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return img
 
     @staticmethod
+    def _ceilingPanelTexture(size=512, rows=2, cols=3, marginFrac=0.10):
+        """Grid of bright rectangular light-fixture panels on a dark ceiling background - baked
+        once and fed to _ceilingLightActor as both the base color and emissive source (see
+        _tableScreenTexture for the same trick), so the overhead light rig (_physicalLight)
+        reads as coming from visible fixtures rather than the ceiling glowing uniformly."""
+        bg = np.array(CEILING_PANEL_BG_COLOR) * 255.0
+        panel = np.array(OVERHEAD_LIGHT_COLOR) * 255.0
+        img = np.tile(bg.astype(np.uint8), (size, size, 1))
+        cellH, cellW = size / rows, size / cols
+        for r in range(rows):
+            for c in range(cols):
+                y0 = int(r * cellH + cellH * marginFrac)
+                y1 = int((r + 1) * cellH - cellH * marginFrac)
+                x0 = int(c * cellW + cellW * marginFrac)
+                x1 = int((c + 1) * cellW - cellW * marginFrac)
+                img[y0:y1, x0:x1, :] = panel.astype(np.uint8)
+        return img
+
+    @staticmethod
     def _tableScreenTexture(size=512):
         """Concentric rings + radial spokes on a dark background - a circuit/targeting-pad look
         for the holo-readout inset in the tabletop. Uses the dim accent (not the full-bright
@@ -1210,19 +1279,37 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     def _updateSceneViewReadout(self) -> None:
         """Show the current scene view's name on the info screen (or a placeholder before the
         user has cycled to one - see _sceneViewIndex). Scene view names are free text the user
-        entered elsewhere, so they're truncated to keep the info screen a fixed, bounded size."""
+        entered elsewhere, so they're fit to the info screen - see _setSceneViewText."""
         if self._sceneViewTextActor is None:
             return
         logic = self._sceneViewsLogic()
         name = None
         if logic is not None and 0 <= self._sceneViewIndex < logic.GetNumberOfSceneViews():
             name = logic.GetNthSceneViewName(self._sceneViewIndex)
-        if not name:
-            self._sceneViewTextActor.SetInput(_("(live scene)"))
+        self._setSceneViewText(name if name else _("(live scene)"))
+
+    def _setSceneViewText(self, name) -> None:
+        """Set the scene-view text, truncating (with an ellipsis) only as much as actually
+        needed to fit INFO_SCREEN_NAME_MAX_WIDTH_M - measured via the actor's own rendered
+        bounds, rather than a fixed character count. A fixed count either truncated ordinary
+        short names that had plenty of room left on the screen, or would still overflow on
+        unusually wide characters - this instead fits exactly what the current name needs."""
+        actor = self._sceneViewTextActor
+        bounds = [0.0] * 6
+
+        def fits(text) -> bool:
+            actor.SetInput(text)
+            actor.GetBounds(bounds)
+            return bounds[1] - bounds[0] <= INFO_SCREEN_NAME_MAX_WIDTH_M
+
+        if fits(name):
             return
-        if len(name) > INFO_SCREEN_NAME_MAX_CHARS:
-            name = name[:INFO_SCREEN_NAME_MAX_CHARS - 1] + "…"
-        self._sceneViewTextActor.SetInput(name)
+        truncated = name
+        while len(truncated) > 1:
+            truncated = truncated[:-1]
+            if fits(truncated + "…"):
+                return
+        actor.SetInput("…")
 
     def _updateTableScreenOrientation(self) -> None:
         """Spin the table screen's own texture by the accumulated turntable angle, on top of
