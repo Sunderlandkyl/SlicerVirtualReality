@@ -36,22 +36,27 @@ assert VRViewer.VRViewerLogic._extentAlongAxis([0, -1, 0, 0, 0, 0], [0, 0, 1]) =
 print("extentAlongAxis: OK")
 
 # computePhysicalToWorld with M0 = identity: the data center should appear at the table
-# physical location, i.e. M maps the table point -> data center (zero-extent data, no lift).
+# physical location, offset by the fixed TABLE_LIFT_BUFFER_MM along "up" (zero-extent data,
+# so that's the only offset) - same invariant the in-module VRViewerTest.test_VRViewerLogic1
+# checks.
 identity = vtk.vtkMatrix4x4()
 dataCenter = [10.0, 20.0, 30.0]
 emptyBounds = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]
+up = VRViewer.VRViewerLogic._worldUp(identity)
+expectedCenter = [dataCenter[a] - up[a] * VRViewer.TABLE_LIFT_BUFFER_MM for a in range(3)]
 m = logic.computePhysicalToWorld(identity, 1.0, 0.0, emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
 mapped = m.MultiplyPoint([VRViewer.TABLE_PHYSICAL[0], VRViewer.TABLE_PHYSICAL[1], VRViewer.TABLE_PHYSICAL[2], 1.0])
 for a in range(3):
-    assert abs(mapped[a] - dataCenter[a]) < 1e-4, (a, mapped[a], dataCenter[a])
+    assert abs(mapped[a] - expectedCenter[a]) < 1e-4, (a, mapped[a], expectedCenter[a])
 
-# Placement invariant holds at any rotation angle (data center stays on the table point).
+# Placement invariant holds at any rotation angle (data center stays on the table point) -
+# rotation is about "up", so the same lift-adjusted expectation applies unchanged.
 for angleDeg in (37.0, 90.0, 180.0):
     m = logic.computePhysicalToWorld(
         identity, 1.0, vtk.vtkMath.RadiansFromDegrees(angleDeg), emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
     mapped = m.MultiplyPoint([VRViewer.TABLE_PHYSICAL[0], VRViewer.TABLE_PHYSICAL[1], VRViewer.TABLE_PHYSICAL[2], 1.0])
     for a in range(3):
-        assert abs(mapped[a] - dataCenter[a]) < 1e-4, (angleDeg, a)
+        assert abs(mapped[a] - expectedCenter[a]) < 1e-4, (angleDeg, a)
 
 # Scale invariant: at relScale s, a world offset shrinks by 1/s in physical/view space.
 m2 = logic.computePhysicalToWorld(identity, 2.0, 0.0, emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
@@ -74,15 +79,6 @@ logic._dataBounds = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]  # empty -> fit 1.0
 assert logic._computeFitRelScale() == 1.0
 logic._basePhysicalToWorld = None
 print("computeFitRelScale: OK")
-
-# Active-slice cycling wraps Red -> Green -> Yellow -> Red.
-logic._activeSliceIndex = 0
-seen = []
-for _i in range(4):
-    seen.append(VRViewer.SLICE_NODE_IDS[logic._activeSliceIndex])
-    logic.cycleActiveSlice()
-assert seen == [VRViewer.SLICE_NODE_IDS[0], VRViewer.SLICE_NODE_IDS[1], VRViewer.SLICE_NODE_IDS[2], VRViewer.SLICE_NODE_IDS[0]], seen
-print("cycleActiveSlice: OK")
 
 # Auto-spin toggles.
 logic._autoSpin = False
@@ -111,32 +107,44 @@ center = VRViewer.VRViewerLogic._combinedRASCenter([visibleModel])
 assert all(abs(c) < 1e-6 for c in center), center
 print("combinedRASBounds/Center: OK")
 
-# ---------------------------------------------------------------- slices (no scene geometry moved)
+# ---------------------------------------------------------------- reformat slice
+#
+# _updateReformatFromPlane is pure MRML/VTK math (no VR/renderer needed): given the reformat
+# transform node's pose (what _trackReformatPlaneToController sets via vtkMatrix4x4.PoseToMatrix
+# on every grip-held pose update), it rebuilds the slice's SliceToRAS to match it exactly.
 
-red = slicer.mrmlScene.GetNodeByID("vtkMRMLSliceNodeRed")
-if red is not None:
-    before = red.GetSliceVisible()
-    # Capture SliceToRAS to confirm toggling does NOT alter slice geometry.
-    original = vtk.vtkMatrix4x4()
-    original.DeepCopy(red.GetSliceToRAS())
-    logic.toggleSlices()
-    after = red.GetSliceVisible()
-    assert after != before, (before, after)
-    for r in range(4):
-        for c in range(4):
-            assert abs(red.GetSliceToRAS().GetElement(r, c) - original.GetElement(r, c)) < 1e-9
-    logic.toggleSlices()
-    assert red.GetSliceVisible() == before
+reformatTransformNode = slicer.mrmlScene.AddNewNodeByClass(
+    "vtkMRMLLinearTransformNode", "VRViewerTestReformatTransform")
+snapPosition = [5.0, 6.0, 7.0]
+snapOrientation = [90.0, 0.0, 0.0, 1.0]  # 90 degree rotation about Z, same [angle, axis] form the pose events get
+poseMatrix = vtk.vtkMatrix4x4()
+vtk.vtkMatrix4x4.PoseToMatrix(snapPosition, snapOrientation, poseMatrix)
+reformatTransformNode.SetMatrixTransformToParent(poseMatrix)
 
-    # scrollActiveSlice moves the active slice's offset by the requested amount.
-    logic._activeSliceIndex = 0  # Red
-    startOffset = red.GetSliceOffset()
-    logic.scrollActiveSlice(12.0)
-    assert abs(red.GetSliceOffset() - (startOffset + 12.0)) < 1e-6, red.GetSliceOffset()
-    logic.scrollActiveSlice(-12.0)
-    assert abs(red.GetSliceOffset() - startOffset) < 1e-6
-    print("scrollActiveSlice: OK")
-    print("toggleSlices (visibility only, geometry untouched): OK")
+reformatSliceLogic = slicer.vtkMRMLSliceLogic()
+reformatSliceLogic.SetMRMLScene(slicer.mrmlScene)
+reformatSliceNode = reformatSliceLogic.AddSliceNode("VRViewerTestReformat")
+
+logic._reformatTransformNode = reformatTransformNode
+logic._reformatSliceNode = reformatSliceNode
+logic._reformatMonitorActor = None
+logic._updateReformatFromPlane()
+
+expectedMatrix = reformatTransformNode.GetMatrixTransformToParent()
+sliceToRAS = reformatSliceNode.GetSliceToRAS()
+for r in range(4):
+    for c in range(4):
+        assert abs(sliceToRAS.GetElement(r, c) - expectedMatrix.GetElement(r, c)) < 1e-6
+print("updateReformatFromPlane: OK")
+
+logic._reformatTransformNode = None
+logic._reformatSliceNode = None
+reformatCompositeNode = reformatSliceLogic.GetSliceCompositeNode()
+reformatSliceLogic = None  # release before removing the slice node it observes
+slicer.mrmlScene.RemoveNode(reformatTransformNode)
+slicer.mrmlScene.RemoveNode(reformatSliceNode)
+if reformatCompositeNode is not None:
+    slicer.mrmlScene.RemoveNode(reformatCompositeNode)
 
 # ---------------------------------------------------------------- scene views
 

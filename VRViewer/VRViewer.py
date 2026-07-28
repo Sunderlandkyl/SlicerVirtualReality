@@ -37,19 +37,22 @@ class VRViewer(ScriptedLoadableModule):
         self.parent.helpText = _("""
 A grounded, presentation-oriented virtual reality viewer. Instead of flying through empty space,
 the user stands in a fixed room with a turntable in front of them. Scene data appears on the
-turntable and is rotated with the left thumbstick; world scale, scene-view navigation, and slice
-visibility are driven by controller buttons.
+turntable and is rotated with the left thumbstick; world scale and scene-view navigation are
+driven by controller buttons. A grabbable arbitrary reformat plane lets the data be sliced from
+any angle, with a floating screen showing the reformatted image live.
 
-The viewer never modifies the MRML scene: placement, scale and rotation are applied only to the
-VR view (via its PhysicalToWorldMatrix), so the desktop 3D and slice views are left untouched.
+The viewer does not modify the user's loaded data: turntable placement, scale and rotation are
+applied only to the VR view (via its PhysicalToWorldMatrix), so the desktop 3D and slice views
+are left untouched. The Red/Green/Yellow slice planes are not shown.
 
 Controller bindings (Oculus Touch):
 - Left thumbstick left/right: rotate the turntable
-- Right thumbstick up/down: scroll the active slice
+- Either grip (hold): the reformat plane follows that controller's position/orientation for as
+  long as the grip is held - release to leave it in place. A floating screen beside the plane
+  shows the reformatted image live. Hidden until toggled on (see below).
+- Right thumbstick click: show/hide the reformat plane and its floating screen
 - B button: increase scale, Y button: decrease scale
 - Right/Left trigger: next/previous scene view
-- Right thumbstick click: toggle slice visibility
-- Right grip: change which slice is active (Red/Green/Yellow)
 - Left thumbstick click: recenter the data on the table (scale 1.0)
 - Left menu button: toggle hands-free auto-spin
 - Two-controller A+X gesture: freely move/scale/rotate (the room follows)
@@ -71,7 +74,6 @@ class VRViewerParameterNode:
 
     rotationSpeedDegPerSec - turntable angular speed at full thumbstick deflection.
     magnificationStep - multiplicative factor applied to world scale per +/- button press.
-    includeSlices - if true, slice planes are shown on entry.
     showRoom - if true, room walls are drawn (the floor and table are always drawn).
     fitToTable - if true, auto-scale each framing so the data spans the table. Off by default:
         with it on, different scene views (with different data extents) land at very different
@@ -82,7 +84,6 @@ class VRViewerParameterNode:
 
     rotationSpeedDegPerSec: Annotated[float, WithinRange(1.0, 360.0)] = 180.0
     magnificationStep: Annotated[float, WithinRange(1.01, 4.0)] = 1.25
-    includeSlices: bool = True
     showRoom: bool = True
     fitToTable: bool = False
     overheadLight: bool = True
@@ -259,7 +260,7 @@ HELP_PANEL_CENTER_Y_M = ROOM_CENTER_Y_M + 0.35
 HELP_PANEL_WIDTH_M = 2.4
 HELP_TITLE_HEIGHT_M = 0.14
 HELP_BODY_HEIGHT_M = 0.085
-HELP_BODY_LINE_COUNT = 8          # keep in sync with the body text in _backWallSignageActors
+HELP_BODY_LINE_COUNT = 7          # keep in sync with the body text in _backWallSignageActors
 HELP_TITLE_BODY_GAP_M = 0.05      # deliberate breathing room between title and body
 HELP_PANEL_TEXT_MARGIN_M = 0.05   # from the usable (border-excluded) interior edge to the text
 HELP_PANEL_BORDER_FRAC = 0.05     # must match _signagePanelTexture's default borderFrac
@@ -385,11 +386,24 @@ DEFAULT_MAGNIFICATION = 1.0
 UNIT_MAGNIFICATION_SCALE = 1000.0
 
 THUMBSTICK_DEADZONE = 0.15
-INPUT_TIMER_INTERVAL_MS = 33  # ~30 Hz continuous-input update (turntable + slice scroll)
-SLICE_SCROLL_MM_PER_SEC = 60.0  # active-slice scroll speed at full right-stick deflection
+INPUT_TIMER_INTERVAL_MS = 33  # ~30 Hz continuous-input update (turntable)
 AUTO_SPIN_DEG_PER_SEC = 12.0    # hands-free presentation rotation speed
 
 SLICE_NODE_IDS = ["vtkMRMLSliceNodeRed", "vtkMRMLSliceNodeGreen", "vtkMRMLSliceNodeYellow"]
+
+# Arbitrary reformat slice: a plain model-node plane that follows a controller's pose for as
+# long as its grip is held (_trackReformatPlaneToController), driving a dedicated, non-layout
+# slice node's SliceToRAS. The reformatted image is shown on a floating screen that rides
+# alongside the plane (see _updateReformatFromPlane), rather than coincident with it, so the
+# translucent handle and the crisp image never occupy the same surface.
+REFORMAT_SLICE_LAYOUT_NAME = "VRReformat"
+REFORMAT_PLANE_NODE_NAME = "VR Reformat Plane"
+REFORMAT_HANDLE_OPACITY = 0.15
+REFORMAT_HANDLE_SIZE_FRAC = 0.6   # handle side length, as a fraction of the background volume's
+                                   # RAS bounding-box diagonal
+DEFAULT_REFORMAT_HANDLE_SIZE_MM = 150.0  # fallback if no volume is loaded yet
+REFORMAT_MONITOR_GAP_FRAC = 0.12  # gap between the handle's edge and the screen's edge, as a
+                                   # fraction of the handle's half-width
 
 
 class VRViewerLogic(ScriptedLoadableModuleLogic):
@@ -455,16 +469,31 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._savedDolly = None
         self._savedGrab = None
 
-        # Continuous inputs (applied on a timer): left-stick rotate, right-stick slice scroll.
+        # Continuous inputs (applied on a timer): left-stick rotate.
         self._leftStickX = 0.0
-        self._rightStickY = 0.0
         self._autoSpin = False
-        self._activeSliceIndex = 0
         self._inputTimer = qt.QTimer()
         self._inputTimer.setInterval(INPUT_TIMER_INTERVAL_MS)
         self._inputTimer.timeout.connect(self._onInputTimer)
 
         self._sceneViewIndex = -1
+
+        # Arbitrary reformat slice (see REFORMAT_* constants above): a plain model node (the
+        # visible handle) riding a transform node that tracks a controller's pose continuously
+        # while its grip is held (see _onGripClick/_onLeftGripPose/_onRightGripPose), plus the
+        # private slice node/composite node/logic that reformats the background volume from that
+        # transform, and the floating screen actor - see _setupReformatSlice/
+        # _teardownReformatSlice/_updateReformatFromPlane. Hidden by default (toggled with the
+        # right thumbstick click - see toggleReformatVisible).
+        self._reformatPlaneModelNode = None
+        self._reformatTransformNode = None
+        self._reformatSliceNode = None
+        self._reformatCompositeNode = None
+        self._reformatSliceLogic = None
+        self._reformatMonitorActor = None
+        self._reformatMonitorHalfSize = (0.0, 0.0)
+        self._reformatGripHeldSide = None  # "Left", "Right", or None - which grip is currently held
+        self._reformatVisible = False
 
     def getParameterNode(self):
         parameterNode = super().getParameterNode()
@@ -531,7 +560,14 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         if widget is None or renderer is None or viewNode is None:
             raise RuntimeError(_("VR view is not available. Is a headset connected?"))
 
-        # Disable free navigation so the left stick / buttons are ours.
+        # Disable free navigation so the left stick / buttons are ours. This alone does NOT
+        # actually stop the right thumbstick's default fly/dolly in practice - _installObservers
+        # additionally observes and aborts the right-stick events at high priority, which is what
+        # really suppresses it; kept here anyway for save/restore symmetry with _savedDolly and
+        # in case it does matter for some other code path. Grab stays disabled too - the reformat
+        # plane follows the controller pose while its grip is held
+        # (_trackReformatPlaneToController), not dragged via the built-in pick-and-grab, so
+        # nothing needs to be grabbable.
         self._savedDolly = widget.isDolly3DEnabled()
         self._savedGrab = widget.isGrabObjectsEnabled()
         widget.setDolly3DEnabled(False)
@@ -553,21 +589,23 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._basePhysicalToWorld = self._alignedBaseMatrix(capturedPhysicalToWorld)
 
         self._magnification = DEFAULT_MAGNIFICATION
-        self._activeSliceIndex = 0
         self._autoSpin = False
         self._leftStickX = 0.0
-        self._rightStickY = 0.0
+        self._reformatGripHeldSide = None
+        self._reformatVisible = False
 
         self._buildChrome(renderer)
         self._buildLighting(renderer)
         self._resetFraming()
 
-        # Show/hide the slice planes on entry per the option.
-        slicesVisible = self.getParameterNode().includeSlices
+        # The Red/Green/Yellow slice planes are never shown in the VR viewer - only the
+        # reformat plane is. Visibility is global (also affects the desktop 3D view).
         for sliceId in SLICE_NODE_IDS:
             sliceNode = slicer.mrmlScene.GetNodeByID(sliceId)
             if sliceNode is not None:
-                sliceNode.SetSliceVisible(slicesVisible)
+                sliceNode.SetSliceVisible(False)
+
+        self._setupReformatSlice(renderer)
 
         self._installObservers(widget)
         self._inputTimer.start()
@@ -599,6 +637,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._savedDolly = None
         self._savedGrab = None
 
+        self._teardownReformatSlice()
         self._teardownChrome()
         self._teardownLighting()
 
@@ -610,8 +649,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
     def applyOptions(self) -> None:
         """Re-read options that can change live. Rotation speed / scale step are read on demand;
-        overheadLight is applied immediately; showRoom / includeSlices take effect on the next
-        enter."""
+        overheadLight is applied immediately; showRoom takes effect on the next enter."""
         if self.isActive:
             self._applyLightingOption()
 
@@ -778,11 +816,10 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             heightMeters=HELP_BODY_HEIGHT_M, color=(0.75, 0.90, 0.95))
         body.SetInput(_(
             "L-stick: rotate turntable\n"
-            "R-stick: scroll active slice\n"
             "B / Y: scale up / down\n"
             "L/R trigger: previous / next scene view\n"
-            "R-stick click: toggle slices\n"
-            "R grip: cycle active slice\n"
+            "Either grip (hold): move reformat plane\n"
+            "R-stick click: show/hide reformat plane\n"
             "L-stick click: reset framing\n"
             "L menu: toggle auto-spin"))
 
@@ -1728,26 +1765,6 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         elif self._autoSpin:
             self.rotateTurntable(vtk.vtkMath.RadiansFromDegrees(AUTO_SPIN_DEG_PER_SEC) * dt)
 
-        # Right stick vertical scrolls the active slice.
-        if abs(self._rightStickY) >= THUMBSTICK_DEADZONE:
-            self.scrollActiveSlice(SLICE_SCROLL_MM_PER_SEC * self._rightStickY * dt)
-
-    # ------------------------------------------------------------------ slice repositioning
-
-    def _activeSliceNode(self):
-        if 0 <= self._activeSliceIndex < len(SLICE_NODE_IDS):
-            return slicer.mrmlScene.GetNodeByID(SLICE_NODE_IDS[self._activeSliceIndex])
-        return None
-
-    def cycleActiveSlice(self) -> None:
-        """Right grip: advance which slice (Red -> Green -> Yellow) the right stick scrolls."""
-        self._activeSliceIndex = (self._activeSliceIndex + 1) % len(SLICE_NODE_IDS)
-
-    def scrollActiveSlice(self, deltaMm) -> None:
-        sliceNode = self._activeSliceNode()
-        if sliceNode is not None:
-            sliceNode.SetSliceOffset(sliceNode.GetSliceOffset() + deltaMm)
-
     # ------------------------------------------------------------------ magnification
 
     def getMagnification(self) -> float:
@@ -1792,24 +1809,248 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         (also clears any gesture drift)."""
         self._resetFraming()
 
-    # ------------------------------------------------------------------ slices
+    # ------------------------------------------------------------------ arbitrary reformat slice
 
-    def toggleSlices(self) -> None:
-        """Toggle 3D visibility of all slice planes together. Visibility is global (also
-        affects the desktop 3D view); the slice planes ride the VR world transform, so they
-        rotate/scale with the data in VR without any change to their SliceToRAS."""
-        anyVisible = False
-        sliceNodes = []
-        for sliceId in SLICE_NODE_IDS:
-            sliceNode = slicer.mrmlScene.GetNodeByID(sliceId)
-            if sliceNode is None:
-                continue
-            sliceNodes.append(sliceNode)
-            if sliceNode.GetSliceVisible():
-                anyVisible = True
-        newVisible = not anyVisible
-        for sliceNode in sliceNodes:
-            sliceNode.SetSliceVisible(newVisible)
+    @staticmethod
+    def _reformatBackgroundVolumeAndGeometry():
+        """The volume driving the reformat slice (mirrors Red's current background volume), and
+        the handle size/center derived from its RAS bounds - falls back to a fixed size at the
+        origin if no volume is loaded yet."""
+        volume = None
+        redComposite = slicer.mrmlScene.GetNodeByID("vtkMRMLSliceCompositeNodeRed")
+        if redComposite is not None:
+            volumeID = redComposite.GetBackgroundVolumeID()
+            if volumeID:
+                volume = slicer.mrmlScene.GetNodeByID(volumeID)
+        if volume is None:
+            volumes = slicer.mrmlScene.GetNodesByClass("vtkMRMLScalarVolumeNode")
+            volumes.UnRegister(None)
+            if volumes.GetNumberOfItems() > 0:
+                volume = volumes.GetItemAsObject(0)
+
+        size = DEFAULT_REFORMAT_HANDLE_SIZE_MM
+        center = [0.0, 0.0, 0.0]
+        if volume is not None:
+            bounds = [0.0] * 6
+            volume.GetRASBounds(bounds)
+            if bounds[0] <= bounds[1]:
+                diagonal = ((bounds[1] - bounds[0]) ** 2 + (bounds[3] - bounds[2]) ** 2
+                            + (bounds[5] - bounds[4]) ** 2) ** 0.5
+                if diagonal > 1e-6:
+                    size = diagonal * REFORMAT_HANDLE_SIZE_FRAC
+                center = [(bounds[0] + bounds[1]) / 2.0, (bounds[2] + bounds[3]) / 2.0,
+                          (bounds[4] + bounds[5]) / 2.0]
+        return volume, size, center
+
+    def _setupReformatSlice(self, renderer) -> None:
+        """Create the reformat plane handle (a plain model node that follows a controller's pose
+        for as long as its grip is held, see _trackReformatPlaneToController) and the private
+        slice pipeline that reformats the background volume from it."""
+        scene = slicer.mrmlScene
+
+        backgroundVolume, size, center = self._reformatBackgroundVolumeAndGeometry()
+        self._reformatMonitorHalfSize = (size / 2.0, size / 2.0)
+
+        halfSize = size / 2.0
+        planeSource = vtk.vtkPlaneSource()
+        planeSource.SetOrigin(-halfSize, -halfSize, 0.0)
+        planeSource.SetPoint1(halfSize, -halfSize, 0.0)
+        planeSource.SetPoint2(-halfSize, halfSize, 0.0)
+        planeSource.Update()
+
+        modelNode = scene.AddNewNodeByClass("vtkMRMLModelNode", REFORMAT_PLANE_NODE_NAME)
+        modelNode.SetAndObservePolyData(planeSource.GetOutput())
+        modelNode.SetHideFromEditors(True)
+        modelNode.SetSaveWithScene(False)
+        modelNode.CreateDefaultDisplayNodes()
+
+        displayNode = modelNode.GetDisplayNode()
+        if displayNode is not None:
+            displayNode.SetColor(*ACCENT_COLOR)
+            displayNode.SetOpacity(REFORMAT_HANDLE_OPACITY)
+            displayNode.SetBackfaceCulling(False)
+            displayNode.SetAmbient(0.9)
+            displayNode.SetDiffuse(0.1)
+            displayNode.SetVisibility2D(False)
+
+        # The plane's own polydata is authored once, at identity (XY plane, +Z normal), centered
+        # on the origin - all subsequent movement happens purely via this transform, which is
+        # overwritten wholesale on every grip-pose update while a grip is held (see
+        # _onGripClick/_onLeftGripPose/_onRightGripPose).
+        transformNode = scene.AddNewNodeByClass(
+            "vtkMRMLLinearTransformNode", REFORMAT_PLANE_NODE_NAME + " Transform")
+        transformNode.SetHideFromEditors(True)
+        transformNode.SetSaveWithScene(False)
+        initialMatrix = vtk.vtkMatrix4x4()
+        initialMatrix.SetElement(0, 3, center[0])
+        initialMatrix.SetElement(1, 3, center[1])
+        initialMatrix.SetElement(2, 3, center[2])
+        transformNode.SetMatrixTransformToParent(initialMatrix)
+        modelNode.SetAndObserveTransformNodeID(transformNode.GetID())
+
+        self._reformatPlaneModelNode = modelNode
+        self._reformatTransformNode = transformNode
+
+        sliceLogic = slicer.vtkMRMLSliceLogic()
+        sliceLogic.SetMRMLScene(scene)
+        sliceNode = sliceLogic.AddSliceNode(REFORMAT_SLICE_LAYOUT_NAME)
+        sliceNode.SetHideFromEditors(True)
+        sliceNode.SetSaveWithScene(False)
+        sliceNode.SetSliceVisible(False)  # the floating screen shows the image, not a coincident model
+        sliceNode.SetFieldOfView(size, size, 1.0)
+
+        compositeNode = sliceLogic.GetSliceCompositeNode()
+        if compositeNode is not None:
+            compositeNode.SetHideFromEditors(True)
+            compositeNode.SetSaveWithScene(False)
+            if backgroundVolume is not None:
+                compositeNode.SetBackgroundVolumeID(backgroundVolume.GetID())
+
+        self._reformatSliceLogic = sliceLogic
+        self._reformatSliceNode = sliceNode
+        self._reformatCompositeNode = compositeNode
+
+        self._reformatMonitorActor = self._buildReformatMonitorActor(self._reformatMonitorHalfSize)
+        texture = vtk.vtkTexture()
+        texture.SetInputConnection(sliceLogic.GetExtractModelTexture().GetOutputPort())
+        texture.InterpolateOn()
+        self._reformatMonitorActor.SetTexture(texture)
+        renderer.AddViewProp(self._reformatMonitorActor)
+
+        self._updateReformatFromPlane()
+        self._applyReformatVisibility()
+
+    def _teardownReformatSlice(self) -> None:
+        renderer = self._vrRenderer()
+        if renderer is not None and self._reformatMonitorActor is not None:
+            renderer.RemoveViewProp(self._reformatMonitorActor)
+        self._reformatMonitorActor = None
+
+        self._reformatSliceLogic = None  # also releases the auto-created (hidden) slice model node
+        self._reformatCompositeNode = None
+
+        scene = slicer.mrmlScene
+        if self._reformatPlaneModelNode is not None:
+            scene.RemoveNode(self._reformatPlaneModelNode)
+        self._reformatPlaneModelNode = None
+
+        if self._reformatTransformNode is not None:
+            scene.RemoveNode(self._reformatTransformNode)
+        self._reformatTransformNode = None
+
+        if self._reformatSliceNode is not None:
+            scene.RemoveNode(self._reformatSliceNode)
+        self._reformatSliceNode = None
+
+    @staticmethod
+    def _buildReformatMonitorActor(halfSize):
+        """The floating screen: a plain textured quad (not a MRML node) authored directly in
+        RAS/world coordinates, like the orientation labels - repositioned each update to ride
+        alongside the reformat plane (see _updateReformatFromPlane)."""
+        halfW, halfH = halfSize
+        source = vtk.vtkPlaneSource()
+        source.SetOrigin(-halfW, -halfH, 0.0)
+        source.SetPoint1(halfW, -halfH, 0.0)
+        source.SetPoint2(-halfW, halfH, 0.0)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(source.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(1.0, 1.0, 1.0)
+        prop.SetAmbient(0.9)
+        prop.SetDiffuse(0.1)
+        prop.BackfaceCullingOff()
+        actor.PickableOff()
+        return actor
+
+    def _onGripClick(self, side, calldata) -> None:
+        """Press: start tracking that hand (and snap immediately, for zero-latency feedback).
+        Release: stop tracking, but only if this hand was the one being tracked - the other
+        hand's grip may be down at the same time."""
+        if self._isPress(calldata):
+            self._reformatGripHeldSide = side
+            self._trackReformatPlaneToController(calldata)
+        elif self._reformatGripHeldSide == side:
+            self._reformatGripHeldSide = None
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onLeftGripClick(self, caller, event, calldata):
+        self._onGripClick("Left", calldata)
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onRightGripClick(self, caller, event, calldata):
+        self._onGripClick("Right", calldata)
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onLeftGripPose(self, caller, event, calldata):
+        # Continuous per-frame pose update (unrelated to click state) - only acts while the left
+        # grip is the one currently held (see _onGripClick).
+        if self._reformatGripHeldSide == "Left":
+            self._trackReformatPlaneToController(calldata)
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onRightGripPose(self, caller, event, calldata):
+        if self._reformatGripHeldSide == "Right":
+            self._trackReformatPlaneToController(calldata)
+
+    def _trackReformatPlaneToController(self, calldata) -> None:
+        """Move the reformat plane to the controller pose carried by calldata - called on grip
+        press and then continuously (via the grip pose events) for as long as that grip stays
+        held, so the plane follows the controller like a physically-attached handle."""
+        if self._reformatTransformNode is None:
+            return
+        try:
+            pos = calldata.GetWorldPosition()
+            ori = calldata.GetWorldOrientation()
+        except Exception:  # noqa: BLE001
+            return
+        matrix = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.PoseToMatrix(pos, ori, matrix)
+        self._reformatTransformNode.SetMatrixTransformToParent(matrix)
+        self._updateReformatFromPlane()
+
+    def toggleReformatVisible(self) -> None:
+        """Right thumbstick click: show/hide the reformat plane handle and its floating screen
+        together. Hidden by default on entry - grabbing/positioning still works while hidden."""
+        self._reformatVisible = not self._reformatVisible
+        self._applyReformatVisibility()
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onToggleReformatVisible(self, caller, event, calldata):
+        if self._isPress(calldata):
+            self.toggleReformatVisible()
+
+    def _applyReformatVisibility(self) -> None:
+        if self._reformatPlaneModelNode is not None:
+            displayNode = self._reformatPlaneModelNode.GetDisplayNode()
+            if displayNode is not None:
+                displayNode.SetVisibility(self._reformatVisible)
+        if self._reformatMonitorActor is not None:
+            self._reformatMonitorActor.SetVisibility(self._reformatVisible)
+
+    def _updateReformatFromPlane(self) -> None:
+        """Rebuild the reformat slice's SliceToRAS from the plane's transform, and move the
+        floating screen to ride alongside it. Called on every grip-tracked pose update (see
+        _trackReformatPlaneToController)."""
+        if self._reformatTransformNode is None or self._reformatSliceNode is None:
+            return
+
+        matrix = self._reformatTransformNode.GetMatrixTransformToParent()
+
+        sliceToRAS = self._reformatSliceNode.GetSliceToRAS()
+        sliceToRAS.DeepCopy(matrix)
+        self._reformatSliceNode.UpdateMatrices()
+
+        if self._reformatMonitorActor is not None:
+            halfW, _halfH = self._reformatMonitorHalfSize
+            offset = 2.0 * halfW + halfW * REFORMAT_MONITOR_GAP_FRAC
+            xAxis = [matrix.GetElement(i, 0) for i in range(3)]
+            monitorMatrix = vtk.vtkMatrix4x4()
+            monitorMatrix.DeepCopy(matrix)
+            for i in range(3):
+                monitorMatrix.SetElement(i, 3, matrix.GetElement(i, 3) + xAxis[i] * offset)
+            self._reformatMonitorActor.SetUserMatrix(monitorMatrix)
 
     # ------------------------------------------------------------------ scene views
 
@@ -1857,8 +2098,10 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             self._observerTags.append(interactor.AddObserver(eventId, callback, highPriority))
 
         add(style.LeftThumbstickEvent, self._onLeftThumbstick)
-        # Right thumbstick is repurposed for slice scroll; its position AND touch events are
-        # translated to fly/dolly by default, so we observe both at high priority and abort them.
+        # widget.setDolly3DEnabled(False) (see enterViewerMode) does NOT actually suppress the
+        # right thumbstick's default fly/dolly behavior in practice - observe both its position
+        # and touch events at high priority and abort them instead, the same way the old
+        # right-stick-scroll code used to (see _abort).
         self._rightStickPosTag = interactor.AddObserver(style.RightThumbstickEvent, self._onRightThumbstick, highPriority)
         self._rightStickTouchTag = interactor.AddObserver(style.RightThumbstickTouchEvent, self._onRightThumbstickTouch, highPriority)
         self._observerTags.append(self._rightStickPosTag)
@@ -1867,10 +2110,15 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         add(style.LeftButton2ClickEvent, self._onScaleDown)    # Y
         add(style.RightTriggerClickEvent, self._onNextSceneView)
         add(style.LeftTriggerClickEvent, self._onPrevSceneView)
-        add(style.RightThumbstickClickEvent, self._onToggleSlices)
         add(style.LeftThumbstickClickEvent, self._onResetScale)
-        add(style.RightGripClickEvent, self._onCycleActiveSlice)
+        add(style.RightThumbstickClickEvent, self._onToggleReformatVisible)
         add(style.LeftMenuClickEvent, self._onToggleAutoSpin)
+        # Click starts/stops tracking that hand (see _onGripClick); the continuous pose events
+        # (fired every frame regardless of button state) do the actual following while held.
+        add(style.LeftGripClickEvent, self._onLeftGripClick)
+        add(style.RightGripClickEvent, self._onRightGripClick)
+        add(style.LeftGripPoseEvent, self._onLeftGripPose)
+        add(style.RightGripPoseEvent, self._onRightGripPose)
 
         # Re-anchor the room whenever the world moves - including via the built-in A+X gesture.
         widget.connect("physicalToWorldMatrixModified()", self._onPhysicalToWorldModified)
@@ -1906,6 +2154,25 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         except Exception:  # noqa: BLE001
             self._leftStickX = 0.0
 
+    def _abort(self, tag):
+        """Stop the default (lower-priority) processing of an event we've taken over."""
+        if self._interactor is not None:
+            command = self._interactor.GetCommand(tag)
+            if command is not None:
+                command.AbortFlagOn()
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onRightThumbstick(self, caller, event, calldata):
+        # Right stick isn't used for anything of ours - this observer exists purely to abort the
+        # default fly/dolly translation (see _installObservers for why setDolly3DEnabled(False)
+        # alone isn't sufficient).
+        self._abort(self._rightStickPosTag)
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onRightThumbstickTouch(self, caller, event, calldata):
+        # Touch down/up also drives fly start/stop by default; suppress it too.
+        self._abort(self._rightStickTouchTag)
+
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onScaleUp(self, caller, event, calldata):
         if self._isPress(calldata):
@@ -1930,38 +2197,6 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     def _onPrevSceneView(self, caller, event, calldata):
         if self._isPress(calldata):
             self.cycleSceneView(-1)
-
-    @vtk.calldata_type(vtk.VTK_OBJECT)
-    def _onToggleSlices(self, caller, event, calldata):
-        if self._isPress(calldata):
-            self.toggleSlices()
-
-    def _abort(self, tag):
-        """Stop the default (lower-priority) processing of an event we've taken over."""
-        if self._interactor is not None:
-            command = self._interactor.GetCommand(tag)
-            if command is not None:
-                command.AbortFlagOn()
-
-    @vtk.calldata_type(vtk.VTK_OBJECT)
-    def _onRightThumbstick(self, caller, event, calldata):
-        try:
-            pos = calldata.GetTrackPadPosition()
-            self._rightStickY = float(pos[1])
-        except Exception:  # noqa: BLE001
-            self._rightStickY = 0.0
-        self._abort(self._rightStickPosTag)  # suppress default fly/dolly
-
-    @vtk.calldata_type(vtk.VTK_OBJECT)
-    def _onRightThumbstickTouch(self, caller, event, calldata):
-        # Touch down/up also drives fly start/stop by default; suppress it.
-        self._rightStickY = 0.0
-        self._abort(self._rightStickTouchTag)
-
-    @vtk.calldata_type(vtk.VTK_OBJECT)
-    def _onCycleActiveSlice(self, caller, event, calldata):
-        if self._isPress(calldata):
-            self.cycleActiveSlice()
 
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onToggleAutoSpin(self, caller, event, calldata):
