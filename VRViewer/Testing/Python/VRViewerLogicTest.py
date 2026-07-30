@@ -185,5 +185,101 @@ assert logic._sceneViewIndex != startIndex or logic.sceneViewCount() == 1
 logic.cycleSceneView(-1)
 print("cycleSceneView: OK")
 
+# ---------------------------------------------------------------- measurement tool
+
+# Gesture-suppress debounce: suppressed only when the other hand was pressed and is still held
+# within the window; not suppressed once the window elapses or if the other hand isn't held -
+# this is the mechanism that keeps the built-in two-controller A+X free-gesture from also firing
+# a spurious place/undo when the user deliberately holds both.
+suppress = VRViewer.VRViewerLogic._isButton1PressSuppressed
+window = VRViewer.MEASURE_GESTURE_SUPPRESS_WINDOW_S
+assert suppress(100.0, True, 100.0 - window / 2.0, window) is True
+assert suppress(100.0, True, 100.0 - window * 2.0, window) is False  # window elapsed
+assert suppress(100.0, False, 100.0 - window / 2.0, window) is False  # other hand not held
+assert suppress(100.0, True, None, window) is False  # no recorded press time
+print("isButton1PressSuppressed: OK")
+
+# Bookkeeping: two placements complete a measurement into a real vtkMRMLMarkupsLineNode left in
+# the scene; a third arms a new pending line; undo priority cancels the pending line (removing it
+# from the scene) before removing a completed measurement (also from the scene, not just the
+# session list) - measurements are real content, unlike the rest of this module's transient state.
+measureLogic = VRViewer.VRViewerLogic()
+measureLogic._measurementPendingLineNode = None
+measureLogic._measurements = []
+
+measureLogic._commitMeasurementPoint((0.0, 0.0, 0.0))
+pendingNode = measureLogic._measurementPendingLineNode
+assert pendingNode is not None
+assert pendingNode.GetNumberOfControlPoints() == 2  # both points start at the same place
+assert len(measureLogic._measurements) == 0
+
+measureLogic._commitMeasurementPoint((3.0, 4.0, 0.0))
+assert measureLogic._measurementPendingLineNode is None
+assert len(measureLogic._measurements) == 1
+completedNode = measureLogic._measurements[0]
+assert completedNode is pendingNode
+lengthMeasurement = completedNode.GetMeasurement("length")
+assert abs(lengthMeasurement.GetValue() - 5.0) < 1e-6, lengthMeasurement.GetValue()
+assert slicer.mrmlScene.GetNodeByID(completedNode.GetID()) is completedNode  # really in the scene
+
+measureLogic._commitMeasurementPoint((1.0, 0.0, 0.0))  # arm a second, incomplete pending line
+pendingNode2 = measureLogic._measurementPendingLineNode
+assert pendingNode2 is not None
+assert len(measureLogic._measurements) == 1  # unchanged - still pending
+
+measureLogic.undoLastMeasurementAction()  # cancels the pending line first, not the completed one
+assert measureLogic._measurementPendingLineNode is None
+assert slicer.mrmlScene.GetNodeByID(pendingNode2.GetID()) is None  # removed from the scene
+assert len(measureLogic._measurements) == 1
+
+measureLogic.undoLastMeasurementAction()  # now removes the completed measurement
+assert len(measureLogic._measurements) == 0
+assert slicer.mrmlScene.GetNodeByID(completedNode.GetID()) is None
+
+measureLogic.undoLastMeasurementAction()  # nothing left - graceful no-op, just a flash
+assert len(measureLogic._measurements) == 0
+assert measureLogic._measureFlashRemaining > 0.0
+print("measurement bookkeeping: OK")
+
+# Synthetic-renderer test of the actual vtkCellPicker.Pick3DRay call - locks down the mechanism
+# the volume-rendering fallback depends on (a PickableOff() actor is excluded from a default,
+# unrestricted pick, so the ray passes through it to whatever's pickable behind it) without
+# needing a headset or even a rendered frame - vtkCellPicker does a geometric ray/cell
+# intersection, not a GPU/z-buffer pick, so a bare vtkRenderer with actors added is sufficient.
+pickRenderer = vtk.vtkRenderer()
+pickRenderer.GetActiveCamera().SetClippingRange(0.01, 1000.0)
+
+
+def _pickTestSphereActor(center, pickable):
+    sphereSource = vtk.vtkSphereSource()
+    sphereSource.SetCenter(*center)
+    sphereSource.SetRadius(5.0)
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputConnection(sphereSource.GetOutputPort())
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.SetPickable(pickable)
+    return actor
+
+
+dataActor = _pickTestSphereActor((0.0, 0.0, -100.0), True)
+chromeActor = _pickTestSphereActor((0.0, 0.0, -20.0), False)  # closer, but PickableOff
+pickRenderer.AddActor(dataActor)
+pickRenderer.AddActor(chromeActor)
+
+pickTestPicker = vtk.vtkCellPicker()
+rayPos = (0.0, 0.0, 0.0)
+identityOrientation = (0.0, 0.0, 0.0, 1.0)  # WXYZ, angle 0 -> ray points along (0, 0, -1)
+hit = pickTestPicker.Pick3DRay(rayPos, identityOrientation, pickRenderer)
+assert hit, "a ray aimed straight through both spheres should hit the pickable one"
+assert pickTestPicker.GetActor() is dataActor, "the closer PickableOff sphere must be excluded"
+hitPos = pickTestPicker.GetPickPosition()
+assert abs(hitPos[2] - (-95.0)) < 1.0, hitPos  # near surface of the far (pickable) sphere
+
+missOrientation = (90.0, 0.0, 1.0, 0.0)  # 90 degrees about Y -> ray points along +X, away from both
+missHit = pickTestPicker.Pick3DRay(rayPos, missOrientation, pickRenderer)
+assert not missHit, "a ray aimed away from both spheres should miss"
+print("Pick3DRay picking mechanics: OK")
+
 slicer.mrmlScene.Clear()
 print("VRViewerLogicTest: ALL PASSED")

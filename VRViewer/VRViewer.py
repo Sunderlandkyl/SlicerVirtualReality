@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from typing import Annotated
 
 import numpy as np
@@ -55,6 +56,9 @@ Controller bindings (Oculus Touch):
 - Right/Left trigger: next/previous scene view
 - Left thumbstick click: recenter the data on the table (scale 1.0)
 - Left menu button: toggle hands-free auto-spin
+- Right A: aim the right controller at the anatomy (or the revealed reformat plane, for
+  volume-only data) and press to place a measurement point; press again to complete the pair
+  into a persisted distance measurement. Left X: undo the last point or measurement.
 - Two-controller A+X gesture: freely move/scale/rotate (the room follows)
 """)
         self.parent.helpText += self.getDefaultModuleDocumentationLink()
@@ -260,7 +264,7 @@ HELP_PANEL_CENTER_Y_M = ROOM_CENTER_Y_M + 0.35
 HELP_PANEL_WIDTH_M = 2.4
 HELP_TITLE_HEIGHT_M = 0.14
 HELP_BODY_HEIGHT_M = 0.085
-HELP_BODY_LINE_COUNT = 7          # keep in sync with the body text in _backWallSignageActors
+HELP_BODY_LINE_COUNT = 8          # keep in sync with the body text in _backWallSignageActors
 HELP_TITLE_BODY_GAP_M = 0.05      # deliberate breathing room between title and body
 HELP_PANEL_TEXT_MARGIN_M = 0.05   # from the usable (border-excluded) interior edge to the text
 HELP_PANEL_BORDER_FRAC = 0.05     # must match _signagePanelTexture's default borderFrac
@@ -414,6 +418,17 @@ DEFAULT_REFORMAT_HANDLE_SIZE_MM = 150.0  # fallback if no volume is loaded yet
 REFORMAT_MONITOR_GAP_FRAC = 0.12  # gap between the handle's edge and the screen's edge, as a
                                    # fraction of the handle's half-width
 
+# In-VR measurement tool: point-to-point distance markers for a solo review session, each a real
+# vtkMRMLMarkupsLineNode (see the "measurement tool" section for why). MEASURE_COLOR is
+# deliberately a different hue from ACCENT_COLOR so measurements read as a distinct layer of
+# content from the chrome/orientation labels; MEASURE_RETICLE_RADIUS_MM sizes the raw-VTK aiming
+# reticle, the only part of this tool that isn't a MRML node.
+MEASURE_COLOR = (1.0, 0.65, 0.15)              # warm amber - tune in-headset
+MEASURE_FLASH_COLOR = (1.0, 0.25, 0.2)         # "nothing to act on" feedback - tune in-headset
+MEASURE_RETICLE_RADIUS_MM = 4.0
+MEASURE_FLASH_DURATION_S = 0.3
+MEASURE_GESTURE_SUPPRESS_WINDOW_S = 0.25       # tune in-headset - see _isButton1PressSuppressed
+
 
 class VRViewerLogic(ScriptedLoadableModuleLogic):
     """All VR Viewer behavior.
@@ -503,6 +518,20 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._reformatMonitorHalfSize = (0.0, 0.0)
         self._reformatGripHeldSide = None  # "Left", "Right", or None - which grip is currently held
         self._reformatVisible = False
+
+        # In-VR point-to-point measurement tool (solo review aid). Unlike the rest of this
+        # module's state, completed measurements are real vtkMRMLMarkupsLineNodes left in the
+        # scene on exit (see _setupMeasurements/_teardownMeasurements docstrings for why) - only
+        # the reticle is a raw VTK actor (pure aiming feedback, not user data).
+        self._measurePicker = None                  # vtkCellPicker, created in _setupMeasurements
+        self._measureReticleActor = None            # live "where am I aiming" indicator
+        self._measureCurrentHit = None              # RAS xyz of the current aim's pick, or None
+        self._measurementPendingLineNode = None     # vtkMRMLMarkupsLineNode with point 1 placed,
+                                                     # point 2 tracking the aim, or None
+        self._measurements = []                     # completed vtkMRMLMarkupsLineNodes (session list)
+        self._measureFlashRemaining = 0.0           # seconds left in the "nothing to act on" flash
+        self._button1Held = {"Left": False, "Right": False}
+        self._button1PressTime = {"Left": None, "Right": None}
 
     def getParameterNode(self):
         parameterNode = super().getParameterNode()
@@ -615,6 +644,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
                 sliceNode.SetSliceVisible(False)
 
         self._setupReformatSlice(renderer)
+        self._setupMeasurements(renderer)
 
         self._installObservers(widget)
         self._inputTimer.start()
@@ -647,6 +677,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._savedGrab = None
 
         self._teardownReformatSlice()
+        self._teardownMeasurements()
         self._teardownChrome()
         self._teardownLighting()
 
@@ -829,6 +860,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             "L/R trigger: previous / next scene view\n"
             "Either grip (hold): move reformat plane\n"
             "R-stick click: show/hide reformat plane\n"
+            "A: place measurement point, X: undo\n"
             "L-stick click: reset framing\n"
             "L menu: toggle auto-spin"))
 
@@ -1213,6 +1245,28 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         prop.SetAmbient(0.3)
         prop.SetDiffuse(0.7)
         actor.PickableOff()
+        return actor
+
+    @staticmethod
+    def _worldGlowDotActor(radius, color, resolution=16):
+        """A small self-lit sphere authored directly in RAS/world (SetPosition, no UserMatrix) -
+        used for the measurement reticle, the armed pending point, and committed measurement
+        endpoints. Same self-lit (ambient-only) treatment as _glowRingActor, so it reads as
+        glowing UI regardless of the room's actual lighting."""
+        source = vtk.vtkSphereSource()
+        source.SetRadius(radius)
+        source.SetThetaResolution(resolution)
+        source.SetPhiResolution(resolution)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(source.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(*color)
+        prop.SetAmbient(1.0)
+        prop.SetDiffuse(0.0)
+        actor.PickableOff()
+        actor.VisibilityOff()
         return actor
 
     # ------------------------------------------------------------------ procedural textures
@@ -1806,6 +1860,14 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         elif self._autoSpin:
             self.rotateTurntable(vtk.vtkMath.RadiansFromDegrees(AUTO_SPIN_DEG_PER_SEC) * dt)
 
+        # Decay the measurement tool's "nothing to act on" flash back to normal reticle color.
+        if self._measureFlashRemaining > 0.0:
+            self._measureFlashRemaining = max(0.0, self._measureFlashRemaining - dt)
+            if self._measureFlashRemaining == 0.0 and self._measureReticleActor is not None:
+                self._measureReticleActor.GetProperty().SetColor(*ACCENT_COLOR)
+                if self._measureCurrentHit is None:
+                    self._measureReticleActor.VisibilityOff()
+
     # ------------------------------------------------------------------ magnification
 
     def getMagnification(self) -> float:
@@ -2093,6 +2155,181 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
                 monitorMatrix.SetElement(i, 3, matrix.GetElement(i, 3) + xAxis[i] * offset)
             self._reformatMonitorActor.SetUserMatrix(monitorMatrix)
 
+    # ------------------------------------------------------------------ measurement tool
+    #
+    # In-VR point-to-point distance measurement, for solo review rather than presentation: aim
+    # the right controller (RightAimPoseEvent - the forward-pointing ray, distinct from the grip
+    # pose the reformat plane uses) at the anatomy, press Right A to place a point, press it
+    # again to complete the pair into a real vtkMRMLMarkupsLineNode. Left X undoes the most
+    # recent action. Both buttons are otherwise unbound in this module - see the debounce note on
+    # _isButton1PressSuppressed for why they're safe to reuse even though the built-in
+    # two-controller free-gesture also watches them (held together).
+    #
+    # Picking uses vtkCellPicker.Pick3DRay against the VR renderer with its default (unrestricted)
+    # settings - every VRViewer-owned chrome/label/UI actor already calls PickableOff(), so a
+    # plain ray pick naturally only ever hits real MRML data actors (models/segmentations), with
+    # no explicit pick-list to maintain. For volume-rendered-only data, revealing the reformat
+    # plane (existing right-thumbstick-click toggle) makes its handle - a real, pickable polydata
+    # quad coincident with a live reformatted cut - a legitimate, anatomically-meaningful pick
+    # target too, at no extra cost.
+    #
+    # Unlike the rest of this module's chrome (raw VTK, VR-renderer-only, never touching the
+    # scene), measurements ARE real content the user creates during review - a real
+    # vtkMRMLMarkupsLineNode per measurement, left in the scene on exit (visible in desktop 3D,
+    # saved with the scene, deletable via the normal Markups/Data UI). This deliberately reuses
+    # Slicer's existing Line markup rather than hand-rolling points/line/label: it already
+    # computes live length (GetMeasurement("length")) and renders itself (line, endpoints,
+    # distance label via PropertiesLabelVisibility) in every view that shows markups, VR included
+    # - no separate actor/texture code needed. Placing the second control point at the same
+    # position as the first, then continuously moving it to the current aim while pending (see
+    # _updateMeasureReticle), gives the same live "rubber-band" preview a hand-rolled line would,
+    # for free. Only an *incomplete* pending line (armed but never finished) is removed on exit -
+    # see _teardownMeasurements - completed measurements are left alone.
+
+    def _setupMeasurements(self, renderer) -> None:
+        self._measurePicker = vtk.vtkCellPicker()
+        self._measureReticleActor = self._worldGlowDotActor(MEASURE_RETICLE_RADIUS_MM, ACCENT_COLOR)
+        renderer.AddViewProp(self._measureReticleActor)
+        self._measureCurrentHit = None
+        self._measurementPendingLineNode = None
+        self._measurements = []
+        self._measureFlashRemaining = 0.0
+        self._button1Held = {"Left": False, "Right": False}
+        self._button1PressTime = {"Left": None, "Right": None}
+
+    def _teardownMeasurements(self) -> None:
+        renderer = self._vrRenderer()
+        if renderer is not None and self._measureReticleActor is not None:
+            renderer.RemoveViewProp(self._measureReticleActor)
+        self._cancelPendingMeasurement()
+        self._measurePicker = None
+        self._measureReticleActor = None
+        self._measureCurrentHit = None
+        self._measurements = []  # completed measurements stay in the scene - see class docstring
+
+    @staticmethod
+    def _isButton1PressSuppressed(now, otherHeld, otherPressTime, windowSeconds) -> bool:
+        """Pure helper (headless-testable). True if the *other* hand's button1 was pressed and
+        is still held within windowSeconds of `now` - keeps a deliberate two-hand free-gesture
+        engagement (the built-in A+X combo) from also firing a spurious place/undo action here.
+        Guarantees at most one of the two ever fires (whichever press the interactor happens to
+        process first fires once, before the other hand registers as held) - the residual single
+        spurious action is an accepted, recoverable trade-off, not a bug: fully closing it would
+        mean delaying every legitimate single-hand press to see if the other hand follows, adding
+        latency to the common case (placing points one at a time) to protect a rarer edge case."""
+        return bool(otherHeld) and otherPressTime is not None and (now - otherPressTime) < windowSeconds
+
+    def _updateMeasureReticle(self, calldata) -> None:
+        """Per-frame aim-ray pick, called on every RightAimPoseEvent - see _onRightAimPose. While
+        a measurement is pending (first point placed), also drags its second control point to
+        the current hit - the "live rubber-band" preview, see the class docstring above."""
+        renderer = self._vrRenderer()
+        if renderer is None or self._measurePicker is None or self._measureReticleActor is None:
+            return
+        try:
+            pos = calldata.GetWorldPosition()
+            ori = calldata.GetWorldOrientation()
+        except Exception:  # noqa: BLE001
+            return
+        hit = self._measurePicker.Pick3DRay(pos, ori, renderer)
+        if hit:
+            self._measureCurrentHit = tuple(self._measurePicker.GetPickPosition())
+            self._measureReticleActor.SetPosition(*self._measureCurrentHit)
+            self._measureReticleActor.GetProperty().SetColor(*ACCENT_COLOR)
+            self._measureReticleActor.VisibilityOn()
+            if self._measurementPendingLineNode is not None:
+                self._measurementPendingLineNode.SetNthControlPointPositionWorld(1, *self._measureCurrentHit)
+        else:
+            self._measureCurrentHit = None
+            self._measureReticleActor.VisibilityOff()
+
+    def _commitMeasurementPoint(self, point) -> None:
+        """First press creates a new Line markup with both control points at the picked position
+        (a valid, zero-length line) and arms it as pending - _updateMeasureReticle then drags its
+        second point to follow the aim every frame. Second press stops the drag and finalizes it
+        as a completed measurement."""
+        if self._measurementPendingLineNode is None:
+            lineNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsLineNode", "VR Measurement")
+            lineNode.CreateDefaultDisplayNodes()
+            lineNode.AddControlPoint(point[0], point[1], point[2])
+            lineNode.AddControlPoint(point[0], point[1], point[2])
+            displayNode = lineNode.GetDisplayNode()
+            if displayNode is not None:
+                displayNode.SetColor(*MEASURE_COLOR)
+                displayNode.SetSelectedColor(*MEASURE_COLOR)
+                displayNode.PropertiesLabelVisibilityOn()
+                displayNode.SetUseGlyphScale(False)
+            self._measurementPendingLineNode = lineNode
+        else:
+            self._measurementPendingLineNode.SetNthControlPointPositionWorld(1, point[0], point[1], point[2])
+            self._measurements.append(self._measurementPendingLineNode)
+            self._measurementPendingLineNode = None
+
+    def _cancelPendingMeasurement(self) -> None:
+        """Remove an armed-but-incomplete pending line node (never finished) from the scene -
+        unlike a completed measurement, it was never a real, deliberately-finished measurement."""
+        if self._measurementPendingLineNode is not None:
+            slicer.mrmlScene.RemoveNode(self._measurementPendingLineNode)
+            self._measurementPendingLineNode = None
+
+    def undoLastMeasurementAction(self) -> None:
+        """Undo priority: cancel an armed-but-incomplete pending line first (most recent action);
+        otherwise remove the last completed measurement from the scene; otherwise flash feedback
+        (nothing to undo). No dedicated "clear all" control - repeated undo already clears
+        everything incrementally."""
+        if self._measurementPendingLineNode is not None:
+            self._cancelPendingMeasurement()
+            return
+        if self._measurements:
+            slicer.mrmlScene.RemoveNode(self._measurements.pop())
+            return
+        self._flashMeasureFeedback()
+
+    def _flashMeasureFeedback(self) -> None:
+        """Brief color flash on the reticle - feedback for a place/undo press that had nothing
+        to act on (no current pick, or no pending/completed measurement to undo). Decayed on the
+        30Hz input timer, see _onInputTimer."""
+        self._measureFlashRemaining = MEASURE_FLASH_DURATION_S
+        if self._measureReticleActor is not None:
+            self._measureReticleActor.GetProperty().SetColor(*MEASURE_FLASH_COLOR)
+            self._measureReticleActor.VisibilityOn()
+
+    def _trackButton1(self, side, calldata) -> None:
+        if self._isPress(calldata):
+            self._button1Held[side] = True
+            self._button1PressTime[side] = time.time()
+        else:
+            self._button1Held[side] = False
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onRightAimPose(self, caller, event, calldata):
+        self._updateMeasureReticle(calldata)
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onPlaceMeasurementPoint(self, caller, event, calldata):
+        self._trackButton1("Right", calldata)
+        if not self._isPress(calldata):
+            return
+        if self._isButton1PressSuppressed(
+                time.time(), self._button1Held["Left"], self._button1PressTime["Left"],
+                MEASURE_GESTURE_SUPPRESS_WINDOW_S):
+            return
+        if self._measureCurrentHit is None:
+            self._flashMeasureFeedback()
+            return
+        self._commitMeasurementPoint(self._measureCurrentHit)
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _onUndoMeasurement(self, caller, event, calldata):
+        self._trackButton1("Left", calldata)
+        if not self._isPress(calldata):
+            return
+        if self._isButton1PressSuppressed(
+                time.time(), self._button1Held["Right"], self._button1PressTime["Right"],
+                MEASURE_GESTURE_SUPPRESS_WINDOW_S):
+            return
+        self.undoLastMeasurementAction()
+
     # ------------------------------------------------------------------ scene views
 
     @staticmethod
@@ -2160,6 +2397,12 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         add(style.RightGripClickEvent, self._onRightGripClick)
         add(style.LeftGripPoseEvent, self._onLeftGripPose)
         add(style.RightGripPoseEvent, self._onRightGripPose)
+        # Measurement tool: aim ray (right hand only, v1) + place/undo buttons. A/X are otherwise
+        # unbound in this module - see the "measurement tool" section for the debounce that keeps
+        # them safe to reuse alongside the built-in two-controller free-gesture.
+        add(style.RightAimPoseEvent, self._onRightAimPose)
+        add(style.RightButton1ClickEvent, self._onPlaceMeasurementPoint)   # A
+        add(style.LeftButton1ClickEvent, self._onUndoMeasurement)         # X
 
         # Re-anchor the room whenever the world moves - including via the built-in A+X gesture.
         widget.connect("physicalToWorldMatrixModified()", self._onPhysicalToWorldModified)
