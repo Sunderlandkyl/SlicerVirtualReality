@@ -68,6 +68,33 @@ dist = ((offsetPhys[0] - centerPhys[0]) ** 2 + (offsetPhys[1] - centerPhys[1]) *
 assert abs(dist - 200.0) < 1e-3, dist  # 100 world units * relScale 2 = 200 physical units
 print("computePhysicalToWorld: OK")
 
+# _frontFacingYawRad: rotation about `up` that spins RAS Anterior to face the physical
+# "toward user" direction. Build an M0 where physical up -> WORLD_UP_RAS (S), physical
+# toward-user -> RAS Right, and physical X -> RAS Anterior (completing a right-handed frame) -
+# i.e. a reference view yawed 90 degrees off of facing the user. Anterior should then need a
+# -90 degree turn to face Right.
+m0 = vtk.vtkMatrix4x4()
+for row, col in ((0, 2), (1, 0), (2, 1)):
+    m0.SetElement(row, col, 1.0)
+for row, col in ((0, 0), (0, 1), (1, 1), (1, 2), (2, 0), (2, 2)):
+    m0.SetElement(row, col, 0.0)
+yaw = VRViewer.VRViewerLogic._frontFacingYawRad(m0)
+assert abs(yaw - (-vtk.vtkMath.Pi() / 2.0)) < 1e-6, yaw
+
+# Confirm it actually does what it claims: rotating ANTERIOR_RAS by `yaw` about the derived
+# up axis lands exactly on the (normalized) toward-user world direction.
+up = VRViewer.VRViewerLogic._worldUp(m0)
+towardUser = list(m0.MultiplyPoint(list(VRViewer.PHYSICAL_TOWARD_USER) + [0.0]))[:3]
+towardUserNorm = [c / vtk.vtkMath.Norm(towardUser) for c in towardUser]
+rot = vtk.vtkTransform()
+rot.RotateWXYZ(vtk.vtkMath.DegreesFromRadians(yaw), up[0], up[1], up[2])
+rotMatrix = vtk.vtkMatrix4x4()
+rot.GetMatrix(rotMatrix)
+rotated = list(rotMatrix.MultiplyPoint(list(VRViewer.ANTERIOR_RAS) + [0.0]))[:3]
+for a in range(3):
+    assert abs(rotated[a] - towardUserNorm[a]) < 1e-6, (a, rotated, towardUserNorm)
+print("frontFacingYawRad: OK")
+
 # Fit-to-table: with base scale factor sf0 (identity M0 -> sf0 = 1), the fit relScale makes the
 # data diagonal span the table diameter. A cube with diagonal D -> fitRelScale = 2*R_table/D.
 logic._basePhysicalToWorld = vtk.vtkMatrix4x4()  # identity, sf0 = 1

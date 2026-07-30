@@ -356,6 +356,15 @@ PHYSICAL_UP = (0.0, 1.0, 0.0)
 # constant everywhere) matters once the built-in free-move/rotate/scale gesture is used.
 WORLD_UP_RAS = (0.0, 0.0, 1.0)
 
+# The physical direction from the table back toward the user - the opposite of TABLE_FORWARD_M's
+# -Z ("in front of the user"). Combined with ANTERIOR_RAS by _frontFacingYawRad so a reset faces
+# the anatomy's Anterior side toward the user instead of whatever yaw the captured reference view
+# (M0) happened to have.
+PHYSICAL_TOWARD_USER = (0.0, 0.0, 1.0)
+
+# MRML RAS convention: R=+X, A=+Y, S=+Z.
+ANTERIOR_RAS = (0.0, 1.0, 0.0)
+
 # Overhead light rig (authored in physical meters, anchored to the room like the chrome).
 # The key light hangs near the ceiling above the table, mostly illuminating the top of the
 # data; on its own a light straight down grazes vertical/side surfaces at a shallow, nearly
@@ -387,7 +396,7 @@ UNIT_MAGNIFICATION_SCALE = 1000.0
 
 THUMBSTICK_DEADZONE = 0.15
 INPUT_TIMER_INTERVAL_MS = 33  # ~30 Hz continuous-input update (turntable)
-AUTO_SPIN_DEG_PER_SEC = 12.0    # hands-free presentation rotation speed
+AUTO_SPIN_DEG_PER_SEC = 30.0    # hands-free presentation rotation speed
 
 SLICE_NODE_IDS = ["vtkMRMLSliceNodeRed", "vtkMRMLSliceNodeGreen", "vtkMRMLSliceNodeYellow"]
 
@@ -1506,6 +1515,36 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return [c / norm for c in up] if norm > 1e-9 else list(WORLD_UP_RAS)
 
     @staticmethod
+    def _frontFacingYawRad(baseMatrix):
+        """Pure helper (headless-testable). The angle to rotate about `_worldUp(baseMatrix)` that
+        spins RAS Anterior to face the physical front of the table (toward the user), so a
+        reset/scene-view-change presents the anatomy front-on rather than at whatever yaw the
+        reference view (M0) happened to capture.
+
+        Both ANTERIOR_RAS and the toward-user direction are projected onto the plane
+        perpendicular to `up` (rotation only happens about that axis) before measuring the
+        signed angle between them.
+        """
+        up = VRViewerLogic._worldUp(baseMatrix)
+        towardUser = list(baseMatrix.MultiplyPoint(
+            [PHYSICAL_TOWARD_USER[0], PHYSICAL_TOWARD_USER[1], PHYSICAL_TOWARD_USER[2], 0.0]))[:3]
+
+        def projectPerpendicular(v):
+            d = vtk.vtkMath.Dot(v, up)
+            projected = [v[i] - d * up[i] for i in range(3)]
+            norm = vtk.vtkMath.Norm(projected)
+            return [c / norm for c in projected] if norm > 1e-9 else None
+
+        anterior = projectPerpendicular(list(ANTERIOR_RAS))
+        towardUser = projectPerpendicular(towardUser)
+        if anterior is None or towardUser is None:
+            return 0.0
+
+        cross = [0.0, 0.0, 0.0]
+        vtk.vtkMath.Cross(anterior, towardUser, cross)
+        return math.atan2(vtk.vtkMath.Dot(cross, up), vtk.vtkMath.Dot(anterior, towardUser))
+
+    @staticmethod
     def computePhysicalToWorld(baseMatrix, relScale, angleRad, dataBounds, dataCenter, tablePhysical):
         """Pure helper (headless-testable). Build the VR PhysicalToWorldMatrix that makes the
         data appear placed on the table, scaled by world factor `relScale`, and spun by
@@ -1600,12 +1639,14 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
     def _applyFraming(self) -> None:
         """Absolute framing: data centered on the table at the framing scale (1.0 = normal VR
-        size, or fitted if the option is on), upright per the reference view, rotation reset.
-        Also clears any gesture drift."""
+        size, or fitted if the option is on), upright per the reference view and yawed so
+        Anterior faces the user (see _frontFacingYawRad), rotation reset. Also clears any
+        gesture drift."""
         if self._basePhysicalToWorld is None:
             return
+        yawRad = self._frontFacingYawRad(self._basePhysicalToWorld)
         matrix = self.computePhysicalToWorld(
-            self._basePhysicalToWorld, self._fitRelScale, 0.0, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
+            self._basePhysicalToWorld, self._fitRelScale, yawRad, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
         self._setPhysicalToWorld(matrix)
         self._turntableAngleRad = 0.0
         self._updateTableScreenOrientation()
@@ -2078,7 +2119,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             return
         self._sceneViewIndex = (self._sceneViewIndex + (1 if direction > 0 else -1)) % count
         logic.RestoreSceneView(self._sceneViewIndex)
-        self._resetFraming()
+        self._recomputeDataBounds()
         self._updateSceneViewReadout()
 
     # ------------------------------------------------------------------ controller observers
