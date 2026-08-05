@@ -90,7 +90,7 @@ endif()
 #-----------------------------------------------------------------------------
 # Extension modules
 add_subdirectory(VirtualReality)
-add_subdirectory(VRViewer)
+add_subdirectory(VRStage)
 ## NEXT_MODULE
 
 #-----------------------------------------------------------------------------

@@ -15,23 +15,32 @@ from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
 from slicer.parameterNodeWrapper import (
     parameterNodeWrapper,
+    parameterPack,
+    Choice,
+    Default,
     WithinRange,
 )
 
 
+def _rgbF(color: "qt.QColor"):
+    """Convert a qt.QColor display option to the 0-1 RGB float triple VTK's SetColor()/
+    emissive-factor APIs expect."""
+    return (color.redF(), color.greenF(), color.blueF())
+
+
 #
-# VRViewer
+# VRStage
 #
 
 
-class VRViewer(ScriptedLoadableModule):
+class VRStage(ScriptedLoadableModule):
     """Uses ScriptedLoadableModule base class, available at:
     https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
     """
 
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
-        self.parent.title = _("VR Viewer")
+        self.parent.title = _("VR Stage")
         self.parent.categories = [translate("qSlicerAbstractCoreModule", "Virtual Reality")]
         self.parent.dependencies = ["VirtualReality"]
         self.parent.contributors = ["Kyle Sunderland (PerkLab, Queen's University)"]
@@ -46,11 +55,12 @@ The viewer does not modify the user's loaded data: turntable placement, scale an
 applied only to the VR view (via its PhysicalToWorldMatrix), so the desktop 3D and slice views
 are left untouched. The Red/Green/Yellow slice planes are not shown.
 
-Controller bindings (Oculus Touch):
-- Left thumbstick left/right: rotate the turntable
+Controller bindings (Oculus Touch, defaults shown - nine of these are rebindable in the Controls
+section below, or via `logic.getParameterNode().controls`):
+- Left thumbstick left/right: rotate the turntable (fixed)
 - Either grip (hold): the reformat plane follows that controller's position/orientation for as
   long as the grip is held - release to leave it in place. A floating screen beside the plane
-  shows the reformatted image live. Hidden until toggled on (see below).
+  shows the reformatted image live. Hidden until toggled on (see below). (fixed)
 - Right thumbstick click: show/hide the reformat plane and its floating screen
 - B button: increase scale, Y button: decrease scale
 - Right/Left trigger: next/previous scene view
@@ -58,8 +68,16 @@ Controller bindings (Oculus Touch):
 - Left menu button: toggle hands-free auto-spin
 - Right A: aim the right controller at the anatomy (or the revealed reformat plane, for
   volume-only data) and press to place a measurement point; press again to complete the pair
-  into a persisted distance measurement. Left X: undo the last point or measurement.
-- Two-controller A+X gesture: freely move/scale/rotate (the room follows)
+  into a persisted distance measurement. Left X: undo the last point or measurement. (aiming with
+  the right controller is fixed; which buttons place/undo is rebindable)
+- Two-controller A+X gesture: freely move/scale/rotate (the room follows) (fixed - independent of
+  any rebinding above, since it's a built-in SlicerVR gesture, not one of this module's actions)
+
+Other modules can reuse this room/table setup while customizing its colors and showing/hiding
+individual components (walls, signage, orientation labels, table screen, info screen), disabling
+the reformat/measurement tools, or rebinding which button triggers which action - see
+VRStageDisplayOptions (`logic.getParameterNode().display`) and VRStageControlBindings
+(`logic.getParameterNode().controls`).
 """)
         self.parent.helpText += self.getDefaultModuleDocumentationLink()
         self.parent.acknowledgementText = _("""
@@ -68,39 +86,13 @@ This module is part of the SlicerVirtualReality extension.
 
 
 #
-# VRViewerParameterNode
+# VRStageWidget
 #
 
 
-@parameterNodeWrapper
-class VRViewerParameterNode:
-    """User-facing options for the VR Viewer.
-
-    rotationSpeedDegPerSec - turntable angular speed at full thumbstick deflection.
-    magnificationStep - multiplicative factor applied to world scale per +/- button press.
-    showRoom - if true, room walls are drawn (the floor and table are always drawn).
-    fitToTable - if true, auto-scale each framing so the data spans the table. Off by default:
-        with it on, different scene views (with different data extents) land at very different
-        scales; off, every framing uses the same real-world scale (1.0 = normal VR size).
-    overheadLight - if true, the table is lit by a light rig anchored above it (with softer
-        fill lights derived from it) instead of the VR view's default lighting.
-    """
-
-    rotationSpeedDegPerSec: Annotated[float, WithinRange(1.0, 360.0)] = 180.0
-    magnificationStep: Annotated[float, WithinRange(1.01, 4.0)] = 1.25
-    showRoom: bool = True
-    fitToTable: bool = False
-    overheadLight: bool = True
-
-
-#
-# VRViewerWidget
-#
-
-
-class VRViewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+class VRStageWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     """Thin desktop panel: enter/exit the viewer and edit options.
-    All behavior lives in VRViewerLogic so it can be tested headless.
+    All behavior lives in VRStageLogic so it can be tested headless.
     """
 
     def __init__(self, parent=None) -> None:
@@ -113,12 +105,12 @@ class VRViewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
 
-        uiWidget = slicer.util.loadUI(self.resourcePath("UI/VRViewer.ui"))
+        uiWidget = slicer.util.loadUI(self.resourcePath("UI/VRStage.ui"))
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
         uiWidget.setMRMLScene(slicer.mrmlScene)
 
-        self.logic = VRViewerLogic()
+        self.logic = VRStageLogic()
 
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
@@ -172,7 +164,7 @@ class VRViewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         try:
             self.logic.enterViewerMode()
         except Exception as e:  # noqa: BLE001
-            slicer.util.errorDisplay(_("Failed to enter VR Viewer: {error}").format(error=str(e)))
+            slicer.util.errorDisplay(_("Failed to enter VR Stage: {error}").format(error=str(e)))
             import traceback
             traceback.print_exc()
         self.updateGUIFromLogic()
@@ -192,7 +184,7 @@ class VRViewerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
 
 #
-# VRViewerLogic
+# VRStageLogic
 #
 
 # Physical-space layout of the room, in meters. The tracking origin is at the user's
@@ -249,6 +241,52 @@ COLLAR_SEAM_RING_OUTER_FRAC = 1.01
 FLOOR_RING_INNER_M = TABLE_RADIUS_M + 0.25
 FLOOR_RING_OUTER_M = TABLE_RADIUS_M + 0.32
 
+# Rebindable controller buttons: the discrete, click-based (Press/Release) controller events
+# that can be freely reassigned to any of this module's button-triggered actions. Deliberately
+# EXCLUDES events that are structural/continuous rather than a simple discrete click:
+#   - LeftThumbstickEvent/RightThumbstickEvent/Right*ThumbstickTouchEvent (continuous axis -
+#     turntable rotation drive, and the suppress-default-fly observers)
+#   - Left/RightGripClickEvent + Left/RightGripPoseEvent (paired continuous pose tracking for
+#     the reformat plane - "either grip" is a fixed structural affordance, not one of the
+#     assignable actions below)
+#   - RightAimPoseEvent (continuous aim ray for the measurement reticle)
+#   - RightSystemClickEvent (reserved for the platform/system menu on most runtimes)
+# Labels use the physical button printed on an Oculus Touch controller where one exists (A/B on
+# the right controller, X/Y on the left) - matching the naming the module's help text already used
+# before this was made configurable.
+CONTROL_BINDING_EVENT_NAMES = {
+    "X": "LeftButton1ClickEvent",
+    "Y": "LeftButton2ClickEvent",
+    "Left Menu": "LeftMenuClickEvent",
+    "Left Trigger": "LeftTriggerClickEvent",
+    "Left Stick Click": "LeftThumbstickClickEvent",
+    "A": "RightButton1ClickEvent",
+    "B": "RightButton2ClickEvent",
+    "Right Trigger": "RightTriggerClickEvent",
+    "Right Stick Click": "RightThumbstickClickEvent",
+}
+CONTROL_BINDING_LABELS = list(CONTROL_BINDING_EVENT_NAMES.keys())
+
+# The module's nine button-triggered actions, in the order they're listed in the Controls UI
+# section and generated into the back-wall signage's control-scheme text, paired with a short
+# human-readable description used only for that signage text (not shown in the Controls UI,
+# where the action itself is the row label - see VRStageControlBindings). Defaults (set on the
+# parameterPack fields below) reproduce the module's original fixed bindings exactly, so behavior
+# is unchanged until a user actually rebinds something in the Controls UI. HELP_BODY_LINE_COUNT
+# below is derived from this list's length (+2 for the fixed rotate/grip lines) rather than
+# hand-counted, so the back-wall signage panel auto-resizes if an action is ever added/removed.
+CONTROL_ACTION_ORDER = [
+    ("scaleUp", "scale up"),
+    ("scaleDown", "scale down"),
+    ("nextSceneView", "next scene view"),
+    ("prevSceneView", "previous scene view"),
+    ("resetFraming", "reset framing"),
+    ("toggleReformatVisible", "show/hide reformat plane"),
+    ("placeMeasurementPoint", "place measurement point"),
+    ("undoMeasurement", "undo point/measurement"),
+    ("toggleAutoSpin", "toggle auto-spin"),
+]
+
 # Back-wall signage: the control-scheme text lives on the wall behind the table (rather than
 # crowding the table edge closest to the user), keeping the table itself uncluttered so the
 # anatomy on it is easy to read accurately.
@@ -264,7 +302,7 @@ HELP_PANEL_CENTER_Y_M = ROOM_CENTER_Y_M + 0.35
 HELP_PANEL_WIDTH_M = 2.4
 HELP_TITLE_HEIGHT_M = 0.14
 HELP_BODY_HEIGHT_M = 0.085
-HELP_BODY_LINE_COUNT = 8          # keep in sync with the body text in _backWallSignageActors
+HELP_BODY_LINE_COUNT = 1 + len(CONTROL_ACTION_ORDER) + 1  # rotate line + one per action + grip line
 HELP_TITLE_BODY_GAP_M = 0.05      # deliberate breathing room between title and body
 HELP_PANEL_TEXT_MARGIN_M = 0.05   # from the usable (border-excluded) interior edge to the text
 HELP_PANEL_BORDER_FRAC = 0.05     # must match _signagePanelTexture's default borderFrac
@@ -385,10 +423,10 @@ FILL_LIGHT_INTENSITY_FACTOR = 0.6  # fraction of the key light's intensity, appl
 
 # Ceiling light panels: a purely visual fixture (baked emissive texture, casts no actual light
 # of its own) mounted just below the room's ceiling so the overhead rig above has a visible
-# source, rather than the room appearing lit from nowhere. Only relevant when showRoom is set,
-# since without walls there's no ceiling surface for it to read as being mounted into.
+# source, rather than the room appearing lit from nowhere. Only relevant when display.showWalls
+# is set, since without walls there's no ceiling surface for it to read as being mounted into.
+# Its background uses display.columnColor (the same tone as the column/post) - see _buildChrome.
 CEILING_LIGHT_OFFSET_M = 0.01   # just inside the room cube's inner ceiling surface, avoids z-fighting
-CEILING_PANEL_BG_COLOR = COLUMN_COLOR
 CEILING_LIGHT_EMISSIVE_FACTOR = (1.0, 1.0, 1.0)
 
 MIN_MAGNIFICATION = 0.01
@@ -430,8 +468,110 @@ MEASURE_FLASH_DURATION_S = 0.3
 MEASURE_GESTURE_SUPPRESS_WINDOW_S = 0.25       # tune in-headset - see _isButton1PressSuppressed
 
 
-class VRViewerLogic(ScriptedLoadableModuleLogic):
-    """All VR Viewer behavior.
+#
+# VRStageDisplayOptions / VRStageControlBindings / VRStageParameterNode
+#
+
+
+@parameterPack
+class VRStageDisplayOptions:
+    """Colors and component visibility for the room/table chrome - exposed so other modules can
+    reuse VRStage's grounded-room setup while customizing its look, e.g. a module with its own
+    branding might set a different accentColor, or hide the back-wall signage/orientation labels
+    it doesn't want shown alongside its own content. Access via
+    `slicer.util.getModuleLogic('VRStage').getParameterNode().display`.
+
+    Colors default to this module's original "medical sci-fi" palette. Most are baked into
+    procedural textures at chrome-build time (table screen, walls, floor grid, ceiling panel,
+    signage panels) and therefore only take effect on the *next* enterViewerMode() call - like
+    showWalls/fitToTable, not live while already active. overheadLightColor and accentColor (on
+    the orientation labels only) ARE applied live by applyOptions(), since those are plain
+    vtkLight/actor colors with no baked texture involved.
+
+    Visibility flags are read once when the chrome is built (enterViewerMode/_buildChrome) -
+    same next-enter timing as the baked colors above.
+
+    enableReformatTool / enableMeasurementTool skip setting up those tools entirely on the next
+    enterViewerMode() - useful for a module that wants the room/table but not these interactions.
+    """
+
+    accentColor: Annotated[qt.QColor, Default(qt.QColor.fromRgbF(*ACCENT_COLOR))]
+    accentColorDim: Annotated[qt.QColor, Default(qt.QColor.fromRgbF(*ACCENT_COLOR_DIM))]
+    floorColor: Annotated[qt.QColor, Default(qt.QColor.fromRgbF(*FLOOR_BASE_COLOR))]
+    wallColor: Annotated[qt.QColor, Default(qt.QColor.fromRgbF(*WALL_BASE_COLOR))]
+    columnColor: Annotated[qt.QColor, Default(qt.QColor.fromRgbF(*COLUMN_COLOR))]
+    tableColor: Annotated[qt.QColor, Default(qt.QColor.fromRgbF(*TABLE_RING_COLOR))]
+    rimBandColor: Annotated[qt.QColor, Default(qt.QColor.fromRgbF(*RIM_BAND_COLOR))]
+    tableScreenBackgroundColor: Annotated[qt.QColor, Default(qt.QColor.fromRgbF(*TABLE_SCREEN_BG_COLOR))]
+    overheadLightColor: Annotated[qt.QColor, Default(qt.QColor.fromRgbF(*OVERHEAD_LIGHT_COLOR))]
+
+    showWalls: bool = True              # room walls + ceiling light panel (floor/table are always drawn)
+    showBackWallSignage: bool = True    # the control-scheme help text (independent of showWalls)
+    showTableScreen: bool = True        # the holo readout inset in the tabletop
+    showInfoScreen: bool = True         # the scale/scene-view monitor mounted on the table's collar
+    showOrientationLabels: bool = True  # R/L/A/P/S/I billboards
+
+    enableReformatTool: bool = True
+    enableMeasurementTool: bool = True
+
+
+@parameterPack
+class VRStageControlBindings:
+    """Which controller button triggers each of this module's nine button-triggered actions -
+    see CONTROL_BINDING_EVENT_NAMES for the available buttons and CONTROL_ACTION_ORDER for the
+    action list/descriptions. Exposed so a user (or another module) can rebind the default
+    layout, e.g. to avoid a clash with a button that module's own tooling also wants to use.
+
+    Defaults reproduce the module's original fixed bindings exactly. Rebinding only takes effect
+    on the next enterViewerMode() call (observers are installed once per enter, like the rest of
+    this module's options) - not live while already active.
+
+    Nothing prevents two actions from being assigned to the same button: both fire on press,
+    which is rarely useful but not prevented, since validating uniqueness across nine
+    independent combo boxes was judged not worth the added UI complexity.
+
+    Rebinding placeMeasurementPoint/undoMeasurement away from their A/X defaults also loosens
+    the debounce in _isButton1PressSuppressed, which exists specifically to avoid a spurious
+    place/undo when the built-in two-controller free-gesture (always tied to the literal A+X
+    buttons, independent of this pack) is engaged - see that method's docstring.
+    """
+
+    scaleUp: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "B"
+    scaleDown: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Y"
+    nextSceneView: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Right Trigger"
+    prevSceneView: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Left Trigger"
+    resetFraming: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Left Stick Click"
+    toggleReformatVisible: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Right Stick Click"
+    toggleAutoSpin: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Left Menu"
+    placeMeasurementPoint: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "A"
+    undoMeasurement: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "X"
+
+
+@parameterNodeWrapper
+class VRStageParameterNode:
+    """User-facing options for the VR Stage.
+
+    rotationSpeedDegPerSec - turntable angular speed at full thumbstick deflection.
+    magnificationStep - multiplicative factor applied to world scale per +/- button press.
+    fitToTable - if true, auto-scale each framing so the data spans the table. Off by default:
+        with it on, different scene views (with different data extents) land at very different
+        scales; off, every framing uses the same real-world scale (1.0 = normal VR size).
+    overheadLight - if true, the table is lit by a light rig anchored above it (with softer
+        fill lights derived from it) instead of the VR view's default lighting.
+    display - colors and component show/hide options - see VRStageDisplayOptions.
+    controls - which button triggers each action - see VRStageControlBindings.
+    """
+
+    rotationSpeedDegPerSec: Annotated[float, WithinRange(1.0, 360.0)] = 180.0
+    magnificationStep: Annotated[float, WithinRange(1.01, 4.0)] = 1.25
+    fitToTable: bool = False
+    overheadLight: bool = True
+    display: VRStageDisplayOptions = VRStageDisplayOptions()
+    controls: VRStageControlBindings = VRStageControlBindings()
+
+
+class VRStageLogic(ScriptedLoadableModuleLogic):
+    """All VR Stage behavior.
 
     The viewer is entirely non-destructive to the MRML scene: placement, scale and turntable
     rotation are applied ONLY to the VR view, by overriding its PhysicalToWorldMatrix. The
@@ -536,7 +676,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     def getParameterNode(self):
         parameterNode = super().getParameterNode()
         if not self._parameterNode or self._parameterNode.parameterNode != parameterNode:
-            self._parameterNode = VRViewerParameterNode(parameterNode)
+            self._parameterNode = VRStageParameterNode(parameterNode)
         return self._parameterNode
 
     # ------------------------------------------------------------------ VR access
@@ -609,7 +749,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._savedDolly = widget.isDolly3DEnabled()
         self._savedGrab = widget.isGrabObjectsEnabled()
         widget.setDolly3DEnabled(False)
-        widget.setGrabObjectsEnabled(False)
+        #widget.setGrabObjectsEnabled(False)
         try:
             widget.setGestureButtonToNone()
         except Exception:  # noqa: BLE001
@@ -643,8 +783,11 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             if sliceNode is not None:
                 sliceNode.SetSliceVisible(False)
 
-        self._setupReformatSlice(renderer)
-        self._setupMeasurements(renderer)
+        display = self.getParameterNode().display
+        if display.enableReformatTool:
+            self._setupReformatSlice(renderer)
+        if display.enableMeasurementTool:
+            self._setupMeasurements(renderer)
 
         self._installObservers(widget)
         self._inputTimer.start()
@@ -688,10 +831,23 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     # ------------------------------------------------------------------ options
 
     def applyOptions(self) -> None:
-        """Re-read options that can change live. Rotation speed / scale step are read on demand;
-        overheadLight is applied immediately; showRoom takes effect on the next enter."""
-        if self.isActive:
-            self._applyLightingOption()
+        """Re-read options that can change live. Rotation speed / scale step are read on demand.
+        overheadLight/display.overheadLightColor and display.accentColor (orientation labels
+        only) are applied immediately here; every other display.* color/visibility option, plus
+        fitToTable and display.showWalls, only take effect on the next enterViewerMode() call -
+        see VRStageDisplayOptions' docstring for why (most colors are baked into procedural
+        textures at chrome-build time)."""
+        if not self.isActive:
+            return
+        self._applyLightingOption()
+        display = self.getParameterNode().display
+        overheadColor = _rgbF(display.overheadLightColor)
+        for light in self._overheadLights:
+            light.SetColor(*overheadColor)
+        if self._orientationLabelActors:
+            accentColor = _rgbF(display.accentColor)
+            for actor in self._orientationLabelActors.values():
+                actor.GetTextProperty().SetColor(*accentColor)
 
     # ------------------------------------------------------------------ chrome
 
@@ -699,27 +855,37 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         """Create the room/floor/table/text props (authored in physical meters) and add them
         to the VR renderer. They are anchored to physical space in _reanchorChrome()."""
         params = self.getParameterNode()
+        display = params.display
         tableCenterXZ = (0.0, TABLE_FORWARD_M)
+
+        floorColor = _rgbF(display.floorColor)
+        wallColor = _rgbF(display.wallColor)
+        columnColor = _rgbF(display.columnColor)
+        tableColor = _rgbF(display.tableColor)
+        rimBandColor = _rgbF(display.rimBandColor)
+        accentColor = _rgbF(display.accentColor)
+        accentColorDim = _rgbF(display.accentColorDim)
+        overheadLightColor = _rgbF(display.overheadLightColor)
 
         floor = self._discActor(
             center=(0.0, FLOOR_THICKNESS_M / 2.0, 0.0),
-            radius=FLOOR_RADIUS_M, height=FLOOR_THICKNESS_M, color=FLOOR_BASE_COLOR)
+            radius=FLOOR_RADIUS_M, height=FLOOR_THICKNESS_M, color=floorColor)
         floorGrid = self._texturedDiscActor(
             center=(0.0, FLOOR_THICKNESS_M + 0.001, 0.0),
-            radius=FLOOR_RADIUS_M, texture=self._arrayToTexture(self._floorPanelTexture()),
+            radius=FLOOR_RADIUS_M, texture=self._arrayToTexture(self._floorPanelTexture(floorColor)),
             ambient=0.55, diffuse=0.35)
         floorRing = self._glowRingActor(
             center=(tableCenterXZ[0], FLOOR_THICKNESS_M + 0.002, tableCenterXZ[1]),
             innerRadius=FLOOR_RING_INNER_M, outerRadius=FLOOR_RING_OUTER_M,
-            color=ACCENT_COLOR, opacity=0.85)
+            color=accentColor, opacity=0.85)
 
         column = self._discActor(
             center=(0.0, TABLE_HEIGHT_M / 2.0, TABLE_FORWARD_M),
-            radius=COLUMN_RADIUS_M, height=TABLE_HEIGHT_M, color=COLUMN_COLOR)
+            radius=COLUMN_RADIUS_M, height=TABLE_HEIGHT_M, color=columnColor)
         columnBand = self._glowRingActor(
             center=(tableCenterXZ[0], TABLE_HEIGHT_M * 0.30, tableCenterXZ[1]),
             innerRadius=0.0, outerRadius=COLUMN_RADIUS_M * 1.02,
-            color=ACCENT_COLOR_DIM, opacity=0.9)
+            color=accentColorDim, opacity=0.9)
 
         # Raised collar/apron band circling the table, sitting directly under the cap (in the
         # space otherwise occupied only by the thin column) - gives the table a real pedestal
@@ -727,7 +893,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         # into. It's wider than the column, so the two simply overlap; no boolean needed.
         collar = self._discActor(
             center=(0.0, TABLE_HEIGHT_M - RIM_BAND_HEIGHT_M / 2.0, TABLE_FORWARD_M),
-            radius=RIM_BAND_RADIUS_M, height=RIM_BAND_HEIGHT_M, color=RIM_BAND_COLOR)
+            radius=RIM_BAND_RADIUS_M, height=RIM_BAND_HEIGHT_M, color=rimBandColor)
         collar.GetProperty().SetMetallic(0.6)
 
         tableTopY = TABLE_HEIGHT_M + TABLE_TOP_THICKNESS_M
@@ -738,7 +904,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         tableTopRing = self._annulusActor(
             center=(0.0, tableTopY, TABLE_FORWARD_M),
             innerRadius=tableScreenRadius, outerRadius=TABLE_RADIUS_M,
-            height=TABLE_TOP_THICKNESS_M, color=TABLE_RING_COLOR)
+            height=TABLE_TOP_THICKNESS_M, color=tableColor)
         tableTopRing.GetProperty().SetMetallic(1.0)
         tableTopRing.GetProperty().SetRoughness(0.2)  # mirror-like, since it's the cap's top
         tableTopRing.GetProperty().SetSpecular(0.5)
@@ -746,26 +912,38 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         wellFloorHeight = TABLE_TOP_THICKNESS_M - TABLE_SCREEN_RECESS_DEPTH_M
         tableWellFloor = self._discActor(
             center=(0.0, TABLE_HEIGHT_M + wellFloorHeight / 2.0, TABLE_FORWARD_M),
-            radius=tableScreenRadius, height=wellFloorHeight, color=TABLE_RING_COLOR)
+            radius=tableScreenRadius, height=wellFloorHeight, color=tableColor)
         tableWellFloor.GetProperty().SetMetallic(1.0)
         tableWellFloor.GetProperty().SetRoughness(0.5)  # less mirror than the cap's ring
         tableWellFloor.GetProperty().SetInterpolationToPBR()
-        tableScreenTexture = self._arrayToTexture(self._tableScreenTexture())
-        self._tableScreenActor = self._texturedDiscActor(
-            center=(tableCenterXZ[0], TABLE_HEIGHT_M + wellFloorHeight + 0.002, tableCenterXZ[1]),
-            radius=tableScreenRadius, texture=tableScreenTexture, ambient=0.85, diffuse=0.15)
-        # Emissive: the screen reads as self-lit "holo" tech, independent of the room's lighting,
-        # rather than just a lit texture - only the PBR interpolation model supports emissive
-        # textures (see vtkProperty.SetEmissiveTexture), so switch this actor onto that pipeline
-        # and feed it the same baked texture as both the base color and the emissive source.
-        screenProp = self._tableScreenActor.GetProperty()
-        screenProp.SetInterpolationToPBR()
-        tableScreenTexture.UseSRGBColorSpaceOn()  # required for albedo/emissive textures
-        screenProp.SetBaseColorTexture(tableScreenTexture)
-        screenProp.SetEmissiveTexture(tableScreenTexture)
-        screenProp.SetEmissiveFactor(*TABLE_SCREEN_EMISSIVE_FACTOR)
+
+        # The holo readout texture itself is optional (display.showTableScreen) - the recessed
+        # pocket/rim below it (built above) stays either way, it just reads as a bare metal well
+        # with no screen actor is False.
+        self._tableScreenActor = None
+        tableScreenProps = []
+        if display.showTableScreen:
+            tableScreenBg = _rgbF(display.tableScreenBackgroundColor)
+            tableScreenTexture = self._arrayToTexture(
+                self._tableScreenTexture(tableScreenBg, accentColorDim))
+            self._tableScreenActor = self._texturedDiscActor(
+                center=(tableCenterXZ[0], TABLE_HEIGHT_M + wellFloorHeight + 0.002, tableCenterXZ[1]),
+                radius=tableScreenRadius, texture=tableScreenTexture, ambient=0.85, diffuse=0.15)
+            # Emissive: the screen reads as self-lit "holo" tech, independent of the room's
+            # lighting, rather than just a lit texture - only the PBR interpolation model supports
+            # emissive textures (see vtkProperty.SetEmissiveTexture), so switch this actor onto
+            # that pipeline and feed it the same baked texture as both the base color and the
+            # emissive source.
+            screenProp = self._tableScreenActor.GetProperty()
+            screenProp.SetInterpolationToPBR()
+            tableScreenTexture.UseSRGBColorSpaceOn()  # required for albedo/emissive textures
+            screenProp.SetBaseColorTexture(tableScreenTexture)
+            screenProp.SetEmissiveTexture(tableScreenTexture)
+            screenProp.SetEmissiveFactor(*TABLE_SCREEN_EMISSIVE_FACTOR)
+            tableScreenProps = [self._tableScreenActor]
         self._turntableAngleRad = 0.0
         self._updateTableScreenOrientation()
+
         # Seam-line trim on the cap's top surface, directly above where the narrower collar ends
         # below it (an "under-cap" accent marking the structural seam) - stays on TOP of the cap
         # like the original table-edge ring did, since a ring drawn at the actual seam height
@@ -774,38 +952,47 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
             center=(tableCenterXZ[0], tableTopY + 0.003, tableCenterXZ[1]),
             innerRadius=RIM_BAND_RADIUS_M * COLLAR_SEAM_RING_INNER_FRAC,
             outerRadius=RIM_BAND_RADIUS_M * COLLAR_SEAM_RING_OUTER_FRAC,
-            color=ACCENT_COLOR_DIM, opacity=0.75)
+            color=accentColorDim, opacity=0.75)
 
         self._chromeProps = [
             floor, floorGrid, floorRing,
             column, columnBand, collar,
-            tableTopRing, tableWellFloor, self._tableScreenActor, collarSeamRing,
+            tableTopRing, tableWellFloor, collarSeamRing,
         ]
+        self._chromeProps.extend(tableScreenProps)
 
-        if params.showRoom:
-            self._chromeProps.append(self._roomActor(self._arrayToTexture(self._wallPanelTexture())))
-            self._chromeProps.append(self._ceilingLightActor())
-            self._chromeProps.extend(self._backWallSignageActors())
+        if display.showWalls:
+            self._chromeProps.append(self._roomActor(
+                wallColor, self._arrayToTexture(self._wallPanelTexture(wallColor))))
+            self._chromeProps.append(self._ceilingLightActor(columnColor, overheadLightColor))
+        if display.showBackWallSignage:
+            self._chromeProps.extend(self._backWallSignageActors(display, params.controls))
 
-        self._monitorAssembly = self._buildMonitorAssembly()
-        self._chromeProps.append(self._monitorAssembly)
+        if display.showInfoScreen:
+            self._monitorAssembly = self._buildMonitorAssembly(display)
+            self._chromeProps.append(self._monitorAssembly)
+        else:
+            self._monitorAssembly = None
+            self._scaleTextActor = None
+            self._sceneViewTextActor = None
 
         for prop in self._chromeProps:
             prop.SetUserMatrix(self._anchorMatrix)  # shared matrix, updated by _reanchorChrome
             renderer.AddViewProp(prop)
 
-        self._buildOrientationLabels(renderer)
+        if display.showOrientationLabels:
+            self._buildOrientationLabels(renderer, accentColor)
 
         self._updateScaleReadout()
         self._updateSceneViewReadout()
 
     @staticmethod
-    def _signagePanelTexture(size=512, borderFrac=0.05):
+    def _signagePanelTexture(bgColor, borderColor, size=512, borderFrac=0.05):
         """Dark background with an accent border baked in - a single plane can then carry the
         whole panel look, instead of stacking a separate border plane nearly coincident with it
         (see BACK_WALL_PANEL_OFFSET_M for why that stacking z-fights at this distance)."""
-        bg = np.array(TABLE_SCREEN_BG_COLOR) * 255.0
-        border = np.array(ACCENT_COLOR) * 255.0
+        bg = np.array(bgColor) * 255.0
+        border = np.array(borderColor) * 255.0
         img = np.tile(bg.astype(np.uint8), (size, size, 1))
         edge = int(size * borderFrac)
         img[:edge, :, :] = border.astype(np.uint8)
@@ -815,10 +1002,25 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return img
 
     @staticmethod
-    def _backWallSignageActors():
+    def _controlSchemeBodyText(controls):
+        """The back-wall signage's control-scheme text, generated from the current button
+        bindings (see CONTROL_ACTION_ORDER/VRStageControlBindings) rather than hardcoded, so
+        the in-VR sign always reflects whatever the user actually configured - not necessarily
+        the module's original defaults. "Either grip" stays a fixed line since it isn't one of
+        the rebindable actions (see the CONTROL_BINDING_EVENT_NAMES module docstring)."""
+        lines = ["L-stick: rotate turntable"]
+        for fieldName, description in CONTROL_ACTION_ORDER:
+            lines.append(f"{getattr(controls, fieldName)}: {description}")
+        lines.append("Either grip (hold): move reformat plane")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _backWallSignageActors(display, controls):
         """A signage panel on the back wall, behind the table, holding the control-scheme text
         that used to crowd the table's front edge - keeps the table itself uncluttered while
         staying legible at the wall's distance from the user."""
+        bgColor = _rgbF(display.tableScreenBackgroundColor)
+        accentColor = _rgbF(display.accentColor)
         halfW = HELP_PANEL_WIDTH_M / 2.0
         halfH = HELP_PANEL_HEIGHT_M / 2.0
         panelSource = vtk.vtkPlaneSource()
@@ -829,7 +1031,8 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         mapper.SetInputConnection(panelSource.GetOutputPort())
         panel = vtk.vtkActor()
         panel.SetMapper(mapper)
-        panel.SetTexture(VRViewerLogic._arrayToTexture(VRViewerLogic._signagePanelTexture()))
+        panel.SetTexture(VRStageLogic._arrayToTexture(
+            VRStageLogic._signagePanelTexture(bgColor, accentColor)))
         panel.SetPosition(0.0, HELP_PANEL_CENTER_Y_M, BACK_WALL_Z_M + BACK_WALL_PANEL_OFFSET_M)
         panelProp = panel.GetProperty()
         panelProp.SetColor(1.0, 1.0, 1.0)
@@ -846,27 +1049,19 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         bodyBottomY = titleBottomY - HELP_TITLE_BODY_GAP_M - _HELP_BODY_BLOCK_HEIGHT_M
 
         textZ = BACK_WALL_Z_M + BACK_WALL_TEXT_OFFSET_M
-        title = VRViewerLogic._textActor(
+        title = VRStageLogic._textActor(
             position=(0.0, titleBottomY, textZ),
-            heightMeters=HELP_TITLE_HEIGHT_M, color=ACCENT_COLOR)
+            heightMeters=HELP_TITLE_HEIGHT_M, color=accentColor)
         title.SetInput(_("VR VIEWER CONTROLS"))
 
-        body = VRViewerLogic._textActor(
+        body = VRStageLogic._textActor(
             position=(0.0, bodyBottomY, textZ),
             heightMeters=HELP_BODY_HEIGHT_M, color=(0.75, 0.90, 0.95))
-        body.SetInput(_(
-            "L-stick: rotate turntable\n"
-            "B / Y: scale up / down\n"
-            "L/R trigger: previous / next scene view\n"
-            "Either grip (hold): move reformat plane\n"
-            "R-stick click: show/hide reformat plane\n"
-            "A: place measurement point, X: undo\n"
-            "L-stick click: reset framing\n"
-            "L menu: toggle auto-spin"))
+        body.SetInput(VRStageLogic._controlSchemeBodyText(controls))
 
         return [panel, title, body]
 
-    def _buildMonitorAssembly(self):
+    def _buildMonitorAssembly(self, display):
         """The live info readout (current scale + scene view name), mounted as a monitor built
         into the table's collar (see RIM_BAND_* / MONITOR_* above) instead of standing as a sign
         on the flat top - the old sign stood tall enough at the table's near edge to occlude the
@@ -902,7 +1097,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         housingShell = self._boxActor(
             center=(hingeX, housingCenterY, housingCenterZ),
             size=(2.0 * housingHalfW, 2.0 * housingHalfH, MONITOR_HOUSING_DEPTH_M),
-            color=RIM_BAND_COLOR)
+            color=_rgbF(display.rimBandColor))
 
         centerY = housingCenterY
         screenZ = hingeZ + MONITOR_SCREEN_PROUD_M
@@ -916,7 +1111,8 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         screenFace = vtk.vtkActor()
         screenFace.SetMapper(mapper)
         screenFace.SetTexture(self._arrayToTexture(
-            self._signagePanelTexture(borderFrac=INFO_SCREEN_BORDER_FRAC)))
+            self._signagePanelTexture(_rgbF(display.tableScreenBackgroundColor), _rgbF(display.accentColor),
+                                       borderFrac=INFO_SCREEN_BORDER_FRAC)))
         screenFace.SetPosition(hingeX, centerY, screenZ)
         screenProp = screenFace.GetProperty()
         screenProp.SetColor(1.0, 1.0, 1.0)
@@ -934,7 +1130,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
         self._scaleTextActor = self._textActor(
             position=(hingeX, scaleBottomY, textZ),
-            heightMeters=INFO_SCREEN_LINE_HEIGHT_M, color=ACCENT_COLOR)
+            heightMeters=INFO_SCREEN_LINE_HEIGHT_M, color=_rgbF(display.accentColor))
 
         self._sceneViewTextActor = self._textActor(
             position=(hingeX, viewBottomY, textZ),
@@ -988,10 +1184,11 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
                 self._defaultLights.append(light)
                 light = lights.GetNextItem()
 
+        overheadColor = _rgbF(self.getParameterNode().display.overheadLightColor)
         keyPosition = (0.0, OVERHEAD_LIGHT_HEIGHT_M, TABLE_FORWARD_M)
         key = self._physicalLight(
             position=keyPosition, focalPoint=TABLE_PHYSICAL,
-            color=OVERHEAD_LIGHT_COLOR, intensity=OVERHEAD_LIGHT_INTENSITY)
+            color=overheadColor, intensity=OVERHEAD_LIGHT_INTENSITY)
 
         self._overheadLights = [key]
         for angleDeg in FILL_LIGHT_ANGLES_DEG:
@@ -1002,7 +1199,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
                 TABLE_PHYSICAL[2] + FILL_LIGHT_RADIUS_M * math.cos(angleRad))
             self._overheadLights.append(self._physicalLight(
                 position=fillPosition, focalPoint=TABLE_PHYSICAL,
-                color=OVERHEAD_LIGHT_COLOR, intensity=OVERHEAD_LIGHT_INTENSITY * FILL_LIGHT_INTENSITY_FACTOR))
+                color=overheadColor, intensity=OVERHEAD_LIGHT_INTENSITY * FILL_LIGHT_INTENSITY_FACTOR))
 
         for light in self._overheadLights:
             light.SetTransformMatrix(self._anchorMatrix)  # shared matrix, updated by _reanchorChrome
@@ -1102,7 +1299,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return actor
 
     @staticmethod
-    def _roomActor(texture):
+    def _roomActor(color, texture):
         """A large box seen from the inside (front faces culled), wearing a tiled wall-panel
         texture so the bright steel walls read as paneling rather than flat color."""
         source = vtk.vtkCubeSource()
@@ -1118,7 +1315,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
         actor.SetTexture(texture)
-        actor.GetProperty().SetColor(*WALL_BASE_COLOR)
+        actor.GetProperty().SetColor(*color)
         actor.GetProperty().FrontfaceCullingOn()
         actor.GetProperty().BackfaceCullingOff()
         actor.GetProperty().SetAmbient(0.5)
@@ -1127,7 +1324,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return actor
 
     @classmethod
-    def _ceilingLightActor(cls):
+    def _ceilingLightActor(cls, bgColor, panelColor):
         """A flat panel mounted just below the ceiling, textured with a grid of bright
         fixtures (see _ceilingPanelTexture) and fed to the PBR emissive pipeline exactly like
         _tableScreenActor - gives the overhead light rig (_physicalLight) a visible source
@@ -1143,7 +1340,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         mapper.SetInputConnection(source.GetOutputPort())
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        texture = cls._arrayToTexture(cls._ceilingPanelTexture())
+        texture = cls._arrayToTexture(cls._ceilingPanelTexture(bgColor, panelColor))
         texture.UseSRGBColorSpaceOn()  # required for albedo/emissive textures
         prop = actor.GetProperty()
         prop.SetInterpolationToPBR()
@@ -1290,9 +1487,9 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return texture
 
     @staticmethod
-    def _wallPanelTexture(size=256):
+    def _wallPanelTexture(bgColor, size=256):
         """Subtle bright panel-line grid for the room walls."""
-        bg = np.array(WALL_BASE_COLOR) * 255.0
+        bg = np.array(bgColor) * 255.0
         line = np.array([0.55, 0.75, 0.85]) * 255.0
         img = np.tile(bg.astype(np.uint8), (size, size, 1))
         spacing = size // 4
@@ -1302,9 +1499,9 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return img
 
     @staticmethod
-    def _floorPanelTexture(size=512):
+    def _floorPanelTexture(bgColor, size=512):
         """Bright steel floor grid, matching the wall paneling."""
-        bg = np.array(FLOOR_BASE_COLOR) * 255.0
+        bg = np.array(bgColor) * 255.0
         line = np.array([0.45, 0.55, 0.62]) * 255.0
         img = np.tile(bg.astype(np.uint8), (size, size, 1))
         spacing = size // 8
@@ -1314,13 +1511,13 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return img
 
     @staticmethod
-    def _ceilingPanelTexture(size=512, rows=2, cols=3, marginFrac=0.10):
+    def _ceilingPanelTexture(bgColor, panelColor, size=512, rows=2, cols=3, marginFrac=0.10):
         """Grid of bright rectangular light-fixture panels on a dark ceiling background - baked
         once and fed to _ceilingLightActor as both the base color and emissive source (see
         _tableScreenTexture for the same trick), so the overhead light rig (_physicalLight)
         reads as coming from visible fixtures rather than the ceiling glowing uniformly."""
-        bg = np.array(CEILING_PANEL_BG_COLOR) * 255.0
-        panel = np.array(OVERHEAD_LIGHT_COLOR) * 255.0
+        bg = np.array(bgColor) * 255.0
+        panel = np.array(panelColor) * 255.0
         img = np.tile(bg.astype(np.uint8), (size, size, 1))
         cellH, cellW = size / rows, size / cols
         for r in range(rows):
@@ -1333,12 +1530,12 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         return img
 
     @staticmethod
-    def _tableScreenTexture(size=512):
+    def _tableScreenTexture(bgColor, ringColor, size=512):
         """Concentric rings + radial spokes on a dark background - a circuit/targeting-pad look
         for the holo-readout inset in the tabletop. Uses the dim accent (not the full-bright
-        ACCENT_COLOR) so the pattern stays legible without the table reading as a wash of blue."""
-        bg = np.array(TABLE_SCREEN_BG_COLOR) * 255.0
-        ring = np.array(ACCENT_COLOR_DIM) * 255.0
+        accent color) so the pattern stays legible without the table reading as a wash of blue."""
+        bg = np.array(bgColor) * 255.0
+        ring = np.array(ringColor) * 255.0
         img = np.tile(bg.astype(np.uint8), (size, size, 1))
         yy, xx = np.mgrid[0:size, 0:size]
         cx = cy = (size - 1) / 2.0
@@ -1456,10 +1653,10 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
         return actor
 
-    def _buildOrientationLabels(self, renderer) -> None:
+    def _buildOrientationLabels(self, renderer, color) -> None:
         self._orientationLabelActors = {}
         for letter in ORIENTATION_LABEL_AXES:
-            actor = self._billboardTextActor(letter)
+            actor = self._billboardTextActor(letter, color=color)
             renderer.AddViewProp(actor)  # no UserMatrix: authored directly in RAS/world
             self._orientationLabelActors[letter] = actor
         self._updateOrientationLabels()
@@ -1579,7 +1776,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         perpendicular to `up` (rotation only happens about that axis) before measuring the
         signed angle between them.
         """
-        up = VRViewerLogic._worldUp(baseMatrix)
+        up = VRStageLogic._worldUp(baseMatrix)
         towardUser = list(baseMatrix.MultiplyPoint(
             [PHYSICAL_TOWARD_USER[0], PHYSICAL_TOWARD_USER[1], PHYSICAL_TOWARD_USER[2], 0.0]))[:3]
 
@@ -1613,14 +1810,14 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         chrome (anchored with UserMatrix = M) stays put while the data moves.
         """
         # World "up" and the world point at the table location, both derived from M0.
-        up = VRViewerLogic._worldUp(baseMatrix)
+        up = VRStageLogic._worldUp(baseMatrix)
         tableWorld = list(baseMatrix.MultiplyPoint(
             [tablePhysical[0], tablePhysical[1], tablePhysical[2], 1.0]))[:3]
 
         # Float the data just above the table: lift the center by half the (scaled) height, plus
         # a small fixed clearance (TABLE_LIFT_BUFFER_MM, scaled the same way) so the data doesn't
         # sit flush against the table surface.
-        halfHeight = 0.5 * VRViewerLogic._extentAlongAxis(dataBounds, up) * relScale
+        halfHeight = 0.5 * VRStageLogic._extentAlongAxis(dataBounds, up) * relScale
         liftBuffer = TABLE_LIFT_BUFFER_MM * relScale
         target = [tableWorld[i] + up[i] * (halfHeight + liftBuffer) for i in range(3)]
 
@@ -1654,7 +1851,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         try:
             renderWindow.SetPhysicalToWorldMatrix(matrix)
         except Exception:  # noqa: BLE001
-            logging.warning("VRViewer: unable to set PhysicalToWorldMatrix")
+            logging.warning("VRStage: unable to set PhysicalToWorldMatrix")
         self._reanchorChrome(matrix)
         # Changing the physical scale invalidates the camera near/far planes (they are scaled by
         # physicalScale), so recompute them - the same thing SlicerVR's delegate does after a
@@ -1824,7 +2021,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
     @staticmethod
     def _combinedRASCenter(nodes):
-        b = VRViewerLogic._combinedRASBounds(nodes)
+        b = VRStageLogic._combinedRASBounds(nodes)
         return [(b[0] + b[1]) / 2.0, (b[2] + b[3]) / 2.0, (b[4] + b[5]) / 2.0]
 
     # ------------------------------------------------------------------ turntable rotation
@@ -2166,7 +2363,7 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
     # two-controller free-gesture also watches them (held together).
     #
     # Picking uses vtkCellPicker.Pick3DRay against the VR renderer with its default (unrestricted)
-    # settings - every VRViewer-owned chrome/label/UI actor already calls PickableOff(), so a
+    # settings - every VRStage-owned chrome/label/UI actor already calls PickableOff(), so a
     # plain ray pick naturally only ever hits real MRML data actors (models/segmentations), with
     # no explicit pick-list to maintain. For volume-rendered-only data, revealing the reformat
     # plane (existing right-thumbstick-click toggle) makes its handle - a real, pickable polydata
@@ -2375,6 +2572,15 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         def add(eventId, callback):
             self._observerTags.append(interactor.AddObserver(eventId, callback, highPriority))
 
+        # Bind a user-rebindable action (see VRStageControlBindings/CONTROL_BINDING_EVENT_NAMES)
+        # to whatever button is currently configured for it.
+        controls = self.getParameterNode().controls
+
+        def addAction(fieldName, callback):
+            label = getattr(controls, fieldName)
+            eventName = CONTROL_BINDING_EVENT_NAMES[label]
+            add(getattr(style, eventName), callback)
+
         add(style.LeftThumbstickEvent, self._onLeftThumbstick)
         # widget.setDolly3DEnabled(False) (see enterViewerMode) does NOT actually suppress the
         # right thumbstick's default fly/dolly behavior in practice - observe both its position
@@ -2384,25 +2590,28 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
         self._rightStickTouchTag = interactor.AddObserver(style.RightThumbstickTouchEvent, self._onRightThumbstickTouch, highPriority)
         self._observerTags.append(self._rightStickPosTag)
         self._observerTags.append(self._rightStickTouchTag)
-        add(style.RightButton2ClickEvent, self._onScaleUp)     # B
-        add(style.LeftButton2ClickEvent, self._onScaleDown)    # Y
-        add(style.RightTriggerClickEvent, self._onNextSceneView)
-        add(style.LeftTriggerClickEvent, self._onPrevSceneView)
-        add(style.LeftThumbstickClickEvent, self._onResetScale)
-        add(style.RightThumbstickClickEvent, self._onToggleReformatVisible)
-        add(style.LeftMenuClickEvent, self._onToggleAutoSpin)
+        addAction("scaleUp", self._onScaleUp)
+        addAction("scaleDown", self._onScaleDown)
+        addAction("nextSceneView", self._onNextSceneView)
+        addAction("prevSceneView", self._onPrevSceneView)
+        addAction("resetFraming", self._onResetScale)
+        addAction("toggleReformatVisible", self._onToggleReformatVisible)
+        addAction("toggleAutoSpin", self._onToggleAutoSpin)
         # Click starts/stops tracking that hand (see _onGripClick); the continuous pose events
         # (fired every frame regardless of button state) do the actual following while held.
+        # "Either grip" is a fixed structural affordance, not one of the rebindable actions above.
         add(style.LeftGripClickEvent, self._onLeftGripClick)
         add(style.RightGripClickEvent, self._onRightGripClick)
         add(style.LeftGripPoseEvent, self._onLeftGripPose)
         add(style.RightGripPoseEvent, self._onRightGripPose)
-        # Measurement tool: aim ray (right hand only, v1) + place/undo buttons. A/X are otherwise
-        # unbound in this module - see the "measurement tool" section for the debounce that keeps
-        # them safe to reuse alongside the built-in two-controller free-gesture.
+        # Measurement tool: aim ray (right hand only, v1, fixed - not rebindable) + place/undo
+        # buttons (rebindable, default A/X - see the "measurement tool" section for the debounce
+        # that keeps the *defaults* safe to reuse alongside the built-in two-controller
+        # free-gesture; rebinding these away from A/X loosens that debounce's original intent,
+        # see VRStageControlBindings' docstring).
         add(style.RightAimPoseEvent, self._onRightAimPose)
-        add(style.RightButton1ClickEvent, self._onPlaceMeasurementPoint)   # A
-        add(style.LeftButton1ClickEvent, self._onUndoMeasurement)         # X
+        addAction("placeMeasurementPoint", self._onPlaceMeasurementPoint)
+        addAction("undoMeasurement", self._onUndoMeasurement)
 
         # Re-anchor the room whenever the world moves - including via the built-in A+X gesture.
         widget.connect("physicalToWorldMatrixModified()", self._onPhysicalToWorldModified)
@@ -2489,11 +2698,11 @@ class VRViewerLogic(ScriptedLoadableModuleLogic):
 
 
 #
-# VRViewerTest
+# VRStageTest
 #
 
 
-class VRViewerTest(ScriptedLoadableModuleTest):
+class VRStageTest(ScriptedLoadableModuleTest):
     """Runtime self-test mirroring the headless logic assertions (no headset needed)."""
 
     def setUp(self):
@@ -2501,12 +2710,12 @@ class VRViewerTest(ScriptedLoadableModuleTest):
 
     def runTest(self):
         self.setUp()
-        self.test_VRViewerLogic1()
+        self.test_VRStageLogic1()
 
-    def test_VRViewerLogic1(self):
-        self.delayDisplay("Starting VR Viewer logic test")
+    def test_VRStageLogic1(self):
+        self.delayDisplay("Starting VR Stage logic test")
 
-        logic = VRViewerLogic()
+        logic = VRStageLogic()
 
         # Magnification stepping is pure and clamped.
         self.assertAlmostEqual(logic.steppedMagnification(1.0, +1, 1.25), 1.25)
@@ -2522,7 +2731,7 @@ class VRViewerTest(ScriptedLoadableModuleTest):
         emptyBounds = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]  # extent 0
         m = logic.computePhysicalToWorld(identity, 1.0, 0.0, emptyBounds, dataCenter, TABLE_PHYSICAL)
         mapped = m.MultiplyPoint([TABLE_PHYSICAL[0], TABLE_PHYSICAL[1], TABLE_PHYSICAL[2], 1.0])
-        up = VRViewerLogic._worldUp(identity)
+        up = VRStageLogic._worldUp(identity)
         expected = [dataCenter[a] - up[a] * TABLE_LIFT_BUFFER_MM for a in range(3)]
         for a in range(3):
             self.assertAlmostEqual(mapped[a], expected[a], places=4)

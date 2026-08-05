@@ -1,13 +1,14 @@
+import qt
 import vtk
 import slicer
-import VRViewer
+import VRStage
 
-# Headless tests for VRViewerLogic: everything that does not require a headset.
+# Headless tests for VRStageLogic: everything that does not require a headset.
 #
 # WARNING: this test clears the MRML scene. Run it only in an isolated Slicer (ctest),
 # never by exec'ing it into a live working session.
 
-logic = VRViewer.VRViewerLogic()
+logic = VRStage.VRStageLogic()
 
 
 def _addVisibleModel(name, center):
@@ -26,26 +27,26 @@ def _addVisibleModel(name, center):
 # Multiplicative magnification stepping, clamped to [MIN, MAX].
 assert abs(logic.steppedMagnification(1.0, +1, 1.25) - 1.25) < 1e-9
 assert abs(logic.steppedMagnification(1.0, -1, 1.25) - 0.8) < 1e-9
-assert logic.steppedMagnification(VRViewer.MAX_MAGNIFICATION, +1, 2.0) == VRViewer.MAX_MAGNIFICATION
-assert logic.steppedMagnification(VRViewer.MIN_MAGNIFICATION, -1, 2.0) == VRViewer.MIN_MAGNIFICATION
+assert logic.steppedMagnification(VRStage.MAX_MAGNIFICATION, +1, 2.0) == VRStage.MAX_MAGNIFICATION
+assert logic.steppedMagnification(VRStage.MIN_MAGNIFICATION, -1, 2.0) == VRStage.MIN_MAGNIFICATION
 print("steppedMagnification: OK")
 
 # Extent of an AABB along an axis: a 20x40x60 box has vertical (Z) extent 60.
-assert abs(VRViewer.VRViewerLogic._extentAlongAxis([-10, 10, -20, 20, -30, 30], [0, 0, 1]) - 60.0) < 1e-9
-assert VRViewer.VRViewerLogic._extentAlongAxis([0, -1, 0, 0, 0, 0], [0, 0, 1]) == 0.0  # empty
+assert abs(VRStage.VRStageLogic._extentAlongAxis([-10, 10, -20, 20, -30, 30], [0, 0, 1]) - 60.0) < 1e-9
+assert VRStage.VRStageLogic._extentAlongAxis([0, -1, 0, 0, 0, 0], [0, 0, 1]) == 0.0  # empty
 print("extentAlongAxis: OK")
 
 # computePhysicalToWorld with M0 = identity: the data center should appear at the table
 # physical location, offset by the fixed TABLE_LIFT_BUFFER_MM along "up" (zero-extent data,
-# so that's the only offset) - same invariant the in-module VRViewerTest.test_VRViewerLogic1
+# so that's the only offset) - same invariant the in-module VRStageTest.test_VRStageLogic1
 # checks.
 identity = vtk.vtkMatrix4x4()
 dataCenter = [10.0, 20.0, 30.0]
 emptyBounds = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]
-up = VRViewer.VRViewerLogic._worldUp(identity)
-expectedCenter = [dataCenter[a] - up[a] * VRViewer.TABLE_LIFT_BUFFER_MM for a in range(3)]
-m = logic.computePhysicalToWorld(identity, 1.0, 0.0, emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
-mapped = m.MultiplyPoint([VRViewer.TABLE_PHYSICAL[0], VRViewer.TABLE_PHYSICAL[1], VRViewer.TABLE_PHYSICAL[2], 1.0])
+up = VRStage.VRStageLogic._worldUp(identity)
+expectedCenter = [dataCenter[a] - up[a] * VRStage.TABLE_LIFT_BUFFER_MM for a in range(3)]
+m = logic.computePhysicalToWorld(identity, 1.0, 0.0, emptyBounds, dataCenter, VRStage.TABLE_PHYSICAL)
+mapped = m.MultiplyPoint([VRStage.TABLE_PHYSICAL[0], VRStage.TABLE_PHYSICAL[1], VRStage.TABLE_PHYSICAL[2], 1.0])
 for a in range(3):
     assert abs(mapped[a] - expectedCenter[a]) < 1e-4, (a, mapped[a], expectedCenter[a])
 
@@ -53,13 +54,13 @@ for a in range(3):
 # rotation is about "up", so the same lift-adjusted expectation applies unchanged.
 for angleDeg in (37.0, 90.0, 180.0):
     m = logic.computePhysicalToWorld(
-        identity, 1.0, vtk.vtkMath.RadiansFromDegrees(angleDeg), emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
-    mapped = m.MultiplyPoint([VRViewer.TABLE_PHYSICAL[0], VRViewer.TABLE_PHYSICAL[1], VRViewer.TABLE_PHYSICAL[2], 1.0])
+        identity, 1.0, vtk.vtkMath.RadiansFromDegrees(angleDeg), emptyBounds, dataCenter, VRStage.TABLE_PHYSICAL)
+    mapped = m.MultiplyPoint([VRStage.TABLE_PHYSICAL[0], VRStage.TABLE_PHYSICAL[1], VRStage.TABLE_PHYSICAL[2], 1.0])
     for a in range(3):
         assert abs(mapped[a] - expectedCenter[a]) < 1e-4, (angleDeg, a)
 
 # Scale invariant: at relScale s, a world offset shrinks by 1/s in physical/view space.
-m2 = logic.computePhysicalToWorld(identity, 2.0, 0.0, emptyBounds, dataCenter, VRViewer.TABLE_PHYSICAL)
+m2 = logic.computePhysicalToWorld(identity, 2.0, 0.0, emptyBounds, dataCenter, VRStage.TABLE_PHYSICAL)
 inv = vtk.vtkMatrix4x4()
 vtk.vtkMatrix4x4.Invert(m2, inv)  # world -> physical
 centerPhys = inv.MultiplyPoint([dataCenter[0], dataCenter[1], dataCenter[2], 1.0])
@@ -78,19 +79,19 @@ for row, col in ((0, 2), (1, 0), (2, 1)):
     m0.SetElement(row, col, 1.0)
 for row, col in ((0, 0), (0, 1), (1, 1), (1, 2), (2, 0), (2, 2)):
     m0.SetElement(row, col, 0.0)
-yaw = VRViewer.VRViewerLogic._frontFacingYawRad(m0)
+yaw = VRStage.VRStageLogic._frontFacingYawRad(m0)
 assert abs(yaw - (-vtk.vtkMath.Pi() / 2.0)) < 1e-6, yaw
 
 # Confirm it actually does what it claims: rotating ANTERIOR_RAS by `yaw` about the derived
 # up axis lands exactly on the (normalized) toward-user world direction.
-up = VRViewer.VRViewerLogic._worldUp(m0)
-towardUser = list(m0.MultiplyPoint(list(VRViewer.PHYSICAL_TOWARD_USER) + [0.0]))[:3]
+up = VRStage.VRStageLogic._worldUp(m0)
+towardUser = list(m0.MultiplyPoint(list(VRStage.PHYSICAL_TOWARD_USER) + [0.0]))[:3]
 towardUserNorm = [c / vtk.vtkMath.Norm(towardUser) for c in towardUser]
 rot = vtk.vtkTransform()
 rot.RotateWXYZ(vtk.vtkMath.DegreesFromRadians(yaw), up[0], up[1], up[2])
 rotMatrix = vtk.vtkMatrix4x4()
 rot.GetMatrix(rotMatrix)
-rotated = list(rotMatrix.MultiplyPoint(list(VRViewer.ANTERIOR_RAS) + [0.0]))[:3]
+rotated = list(rotMatrix.MultiplyPoint(list(VRStage.ANTERIOR_RAS) + [0.0]))[:3]
 for a in range(3):
     assert abs(rotated[a] - towardUserNorm[a]) < 1e-6, (a, rotated, towardUserNorm)
 print("frontFacingYawRad: OK")
@@ -100,7 +101,7 @@ print("frontFacingYawRad: OK")
 logic._basePhysicalToWorld = vtk.vtkMatrix4x4()  # identity, sf0 = 1
 logic._dataBounds = [-50.0, 50.0, -50.0, 50.0, -50.0, 50.0]  # 100 cube, diagonal = 100*sqrt(3)
 diag = (3 ** 0.5) * 100.0
-expectedFit = (2.0 * VRViewer.TABLE_RADIUS_M) / diag
+expectedFit = (2.0 * VRStage.TABLE_RADIUS_M) / diag
 assert abs(logic._computeFitRelScale() - expectedFit) < 1e-9, logic._computeFitRelScale()
 logic._dataBounds = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]  # empty -> fit 1.0
 assert logic._computeFitRelScale() == 1.0
@@ -115,6 +116,114 @@ logic.toggleAutoSpin()
 assert logic._autoSpin is False
 print("toggleAutoSpin: OK")
 
+# ---------------------------------------------------------------- display options
+#
+# VRStageDisplayOptions (parameter node field "display") exposes colors/visibility so other
+# modules can reuse the room/table chrome while customizing it - see VRStage.py's docstring.
+# Defaults must match the module's original palette, and _buildChrome (which only needs a
+# renderer, not a live VR widget/headset) must honor the visibility flags.
+
+displayLogic = VRStage.VRStageLogic()
+defaultDisplay = displayLogic.getParameterNode().display
+assert defaultDisplay.showWalls is True
+assert defaultDisplay.showBackWallSignage is True
+assert defaultDisplay.showTableScreen is True
+assert defaultDisplay.showInfoScreen is True
+assert defaultDisplay.showOrientationLabels is True
+assert defaultDisplay.enableReformatTool is True
+assert defaultDisplay.enableMeasurementTool is True
+expectedAccent = qt.QColor.fromRgbF(*VRStage.ACCENT_COLOR)
+# Compare via 8-bit hex, not QColor.__eq__: the parameter node round-trips colors through
+# name(1)/re-parse (see QColorSerializer), which quantizes to 8-bit and drops the extended-
+# precision float spec fromRgbF() uses - so a direct QColor == would spuriously fail even
+# though both render to the identical color.
+assert defaultDisplay.accentColor.name() == expectedAccent.name(), \
+    (defaultDisplay.accentColor.name(), expectedAccent.name())
+print("VRStageDisplayOptions defaults: OK")
+
+# _buildChrome only needs a bare renderer (no live VR widget) - same synthetic-renderer approach
+# as the Pick3DRay test further below - to exercise the visibility-gating logic headlessly.
+disabledLogic = VRStage.VRStageLogic()
+disabledDisplay = disabledLogic.getParameterNode().display
+disabledDisplay.showOrientationLabels = False
+disabledDisplay.showTableScreen = False
+disabledDisplay.showInfoScreen = False
+disabledLogic._buildChrome(vtk.vtkRenderer())
+assert disabledLogic._orientationLabelActors == {}, "orientation labels should be skipped when disabled"
+assert disabledLogic._tableScreenActor is None, "table screen actor should be skipped when disabled"
+assert disabledLogic._monitorAssembly is None, "info screen should be skipped when disabled"
+# Reset so this doesn't leak into anything else sharing the scene's parameter node.
+disabledDisplay.showOrientationLabels = True
+disabledDisplay.showTableScreen = True
+disabledDisplay.showInfoScreen = True
+
+enabledLogic = VRStage.VRStageLogic()
+enabledLogic._buildChrome(vtk.vtkRenderer())  # defaults: everything on
+assert len(enabledLogic._orientationLabelActors) == 6
+assert enabledLogic._tableScreenActor is not None
+assert enabledLogic._monitorAssembly is not None
+print("VRStageDisplayOptions visibility gating: OK")
+
+# ---------------------------------------------------------------- control bindings
+#
+# VRStageControlBindings (parameter node field "controls") lets a button be reassigned to any
+# of the module's nine button-triggered actions - see CONTROL_BINDING_EVENT_NAMES/
+# CONTROL_ACTION_ORDER in VRStage.py. Defaults must reproduce the module's original fixed
+# bindings exactly (so behavior is unchanged out of the box), every default button label must
+# resolve to a real event on the actual interactor style class (catches a typo'd event name that
+# would otherwise only surface as a crash deep in _installObservers with a live VR headset), and
+# the generated back-wall signage text must have exactly HELP_BODY_LINE_COUNT lines with the
+# right button label substituted in.
+
+controlsLogic = VRStage.VRStageLogic()
+defaultControls = controlsLogic.getParameterNode().controls
+assert defaultControls.scaleUp == "B"
+assert defaultControls.scaleDown == "Y"
+assert defaultControls.nextSceneView == "Right Trigger"
+assert defaultControls.prevSceneView == "Left Trigger"
+assert defaultControls.resetFraming == "Left Stick Click"
+assert defaultControls.toggleReformatVisible == "Right Stick Click"
+assert defaultControls.toggleAutoSpin == "Left Menu"
+assert defaultControls.placeMeasurementPoint == "A"
+assert defaultControls.undoMeasurement == "X"
+print("VRStageControlBindings defaults: OK")
+
+# Every configured button must resolve to a real event name, and (where the real VR interactor
+# style module is importable in this headless environment) a real attribute on that class.
+try:
+    import vtkSlicerVirtualRealityModuleMRMLDisplayableManagerPython as vrDM
+    _style = vrDM.vtkVirtualRealityViewOpenXRInteractorStyle
+except ImportError:
+    _style = None
+for label, eventName in VRStage.CONTROL_BINDING_EVENT_NAMES.items():
+    assert isinstance(label, str) and isinstance(eventName, str)
+    if _style is not None:
+        assert hasattr(_style, eventName), f"{eventName} (button {label!r}) is not a real controller event"
+assert set(VRStage.CONTROL_BINDING_LABELS) == set(VRStage.CONTROL_BINDING_EVENT_NAMES.keys())
+print("CONTROL_BINDING_EVENT_NAMES: OK" + (" (verified against real interactor style)" if _style else " (interactor style module unavailable, name-shape only)"))
+
+# The generated signage text: one line per action (with its currently-bound button substituted)
+# plus the two fixed lines (rotate, grip) - line COUNT must match HELP_BODY_LINE_COUNT exactly,
+# since that constant drives the panel's derived height (see VRStage.py's HELP_PANEL_HEIGHT_M).
+bodyText = VRStage.VRStageLogic._controlSchemeBodyText(defaultControls)
+bodyLines = bodyText.split("\n")
+assert len(bodyLines) == VRStage.HELP_BODY_LINE_COUNT, (len(bodyLines), VRStage.HELP_BODY_LINE_COUNT)
+assert bodyLines[0] == "L-stick: rotate turntable"
+assert bodyLines[-1] == "Either grip (hold): move reformat plane"
+assert "B: scale up" in bodyLines
+assert "A: place measurement point" in bodyLines
+
+# Rebinding is reflected immediately in the generated text (this is what makes the in-VR sign
+# stay accurate after a user rebinds something, instead of showing stale defaults).
+rebindLogic = VRStage.VRStageLogic()
+rebindControls = rebindLogic.getParameterNode().controls
+rebindControls.scaleUp = "Left Menu"
+reboundText = VRStage.VRStageLogic._controlSchemeBodyText(rebindControls)
+assert "Left Menu: scale up" in reboundText.split("\n")
+assert "B: scale up" not in reboundText
+rebindControls.scaleUp = "B"  # reset so this doesn't leak into anything else sharing the scene
+print("control-scheme signage text generation: OK")
+
 # ---------------------------------------------------------------- collection
 
 slicer.mrmlScene.Clear()
@@ -122,15 +231,15 @@ visibleModel = _addVisibleModel("VisibleModel", (0.0, 0.0, 0.0))
 hiddenModel = _addVisibleModel("HiddenModel", (50.0, 0.0, 0.0))
 hiddenModel.GetDisplayNode().SetVisibility(False)
 
-collected = VRViewer.VRViewerLogic._collectVisibleDataNodes()
+collected = VRStage.VRStageLogic._collectVisibleDataNodes()
 collectedIds = [n.GetID() for n in collected]
 assert visibleModel.GetID() in collectedIds, "visible model should be collected"
 assert hiddenModel.GetID() not in collectedIds, "invisible model should be excluded"
 print("collectVisibleDataNodes: OK")
 
-bounds = VRViewer.VRViewerLogic._combinedRASBounds([visibleModel])
+bounds = VRStage.VRStageLogic._combinedRASBounds([visibleModel])
 assert bounds[0] < bounds[1], bounds
-center = VRViewer.VRViewerLogic._combinedRASCenter([visibleModel])
+center = VRStage.VRStageLogic._combinedRASCenter([visibleModel])
 assert all(abs(c) < 1e-6 for c in center), center
 print("combinedRASBounds/Center: OK")
 
@@ -141,7 +250,7 @@ print("combinedRASBounds/Center: OK")
 # on every grip-held pose update), it rebuilds the slice's SliceToRAS to match it exactly.
 
 reformatTransformNode = slicer.mrmlScene.AddNewNodeByClass(
-    "vtkMRMLLinearTransformNode", "VRViewerTestReformatTransform")
+    "vtkMRMLLinearTransformNode", "VRStageTestReformatTransform")
 snapPosition = [5.0, 6.0, 7.0]
 snapOrientation = [90.0, 0.0, 0.0, 1.0]  # 90 degree rotation about Z, same [angle, axis] form the pose events get
 poseMatrix = vtk.vtkMatrix4x4()
@@ -150,7 +259,7 @@ reformatTransformNode.SetMatrixTransformToParent(poseMatrix)
 
 reformatSliceLogic = slicer.vtkMRMLSliceLogic()
 reformatSliceLogic.SetMRMLScene(slicer.mrmlScene)
-reformatSliceNode = reformatSliceLogic.AddSliceNode("VRViewerTestReformat")
+reformatSliceNode = reformatSliceLogic.AddSliceNode("VRStageTestReformat")
 
 logic._reformatTransformNode = reformatTransformNode
 logic._reformatSliceNode = reformatSliceNode
@@ -176,8 +285,8 @@ if reformatCompositeNode is not None:
 # ---------------------------------------------------------------- scene views
 
 svLogic = slicer.modules.sceneviews.logic()
-svLogic.CreateSceneView("VRViewerTestView1")
-svLogic.CreateSceneView("VRViewerTestView2")
+svLogic.CreateSceneView("VRStageTestView1")
+svLogic.CreateSceneView("VRStageTestView2")
 assert logic.sceneViewCount() >= 2, logic.sceneViewCount()
 startIndex = logic._sceneViewIndex
 logic.cycleSceneView(+1)
@@ -191,8 +300,8 @@ print("cycleSceneView: OK")
 # within the window; not suppressed once the window elapses or if the other hand isn't held -
 # this is the mechanism that keeps the built-in two-controller A+X free-gesture from also firing
 # a spurious place/undo when the user deliberately holds both.
-suppress = VRViewer.VRViewerLogic._isButton1PressSuppressed
-window = VRViewer.MEASURE_GESTURE_SUPPRESS_WINDOW_S
+suppress = VRStage.VRStageLogic._isButton1PressSuppressed
+window = VRStage.MEASURE_GESTURE_SUPPRESS_WINDOW_S
 assert suppress(100.0, True, 100.0 - window / 2.0, window) is True
 assert suppress(100.0, True, 100.0 - window * 2.0, window) is False  # window elapsed
 assert suppress(100.0, False, 100.0 - window / 2.0, window) is False  # other hand not held
@@ -203,7 +312,7 @@ print("isButton1PressSuppressed: OK")
 # the scene; a third arms a new pending line; undo priority cancels the pending line (removing it
 # from the scene) before removing a completed measurement (also from the scene, not just the
 # session list) - measurements are real content, unlike the rest of this module's transient state.
-measureLogic = VRViewer.VRViewerLogic()
+measureLogic = VRStage.VRStageLogic()
 measureLogic._measurementPendingLineNode = None
 measureLogic._measurements = []
 
@@ -282,4 +391,4 @@ assert not missHit, "a ray aimed away from both spheres should miss"
 print("Pick3DRay picking mechanics: OK")
 
 slicer.mrmlScene.Clear()
-print("VRViewerLogicTest: ALL PASSED")
+print("VRStageLogicTest: ALL PASSED")
