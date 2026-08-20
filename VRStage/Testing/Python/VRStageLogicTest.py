@@ -69,6 +69,45 @@ dist = ((offsetPhys[0] - centerPhys[0]) ** 2 + (offsetPhys[1] - centerPhys[1]) *
 assert abs(dist - 200.0) < 1e-3, dist  # 100 world units * relScale 2 = 200 physical units
 print("computePhysicalToWorld: OK")
 
+# computeDefaultTableHeightM: inverts computePhysicalToWorld's placement so the data's
+# vertical center lands at TABLE_COMFORT_CENTER_HEIGHT_M physical. Build a base matrix at the
+# standard magnification-1.0 scale (column length = 1000, world mm per physical m).
+s0 = VRStage.UNIT_MAGNIFICATION_SCALE  # 1000.0
+baseM = vtk.vtkMatrix4x4()
+for i in range(3):
+    baseM.SetElement(i, i, s0)
+# Mid-range: 200mm-tall data (bounds ±100 along world-up), relScale 1.0.
+# halfHeight = 0.5 * 200 * 1.0 = 100 world mm; lift = 60 * 1.0 = 60 mm; centerAboveTop = 160/1000 = 0.16 m
+# height = 0.80 - 0.05 - 0.16 = 0.59 m
+midBounds = [-100.0, 100.0, -100.0, 100.0, -100.0, 100.0]  # extent along world-up = 200
+midHeight = VRStage.VRStageLogic.computeDefaultTableHeightM(baseM, 1.0, midBounds)
+assert abs(midHeight - 0.59) < 1e-9, midHeight
+# Tall data: 1800 mm along up -> raw height = 0.80 - 0.05 - (900+60)/1000 = -0.21 -> clamped to MIN
+tallBounds = [-900.0, 900.0, -900.0, 900.0, -900.0, 900.0]
+tallHeight = VRStage.VRStageLogic.computeDefaultTableHeightM(baseM, 1.0, tallBounds)
+assert tallHeight == VRStage.TABLE_HEIGHT_MIN_M, tallHeight
+# Empty bounds -> authored default
+emptyHeight = VRStage.VRStageLogic.computeDefaultTableHeightM(baseM, 1.0, [0.0, -1.0, 0.0, -1.0, 0.0, -1.0])
+assert emptyHeight == VRStage.TABLE_HEIGHT_M, emptyHeight
+# Degenerate zero matrix -> authored default
+zeroM = vtk.vtkMatrix4x4()
+zeroM.Zero()
+assert VRStage.VRStageLogic.computeDefaultTableHeightM(zeroM, 1.0, midBounds) == VRStage.TABLE_HEIGHT_M
+# Consistency lock: the height computeDefaultTableHeightM produces, when fed back into
+# computePhysicalToWorld as part of tablePhysical, should place the data center's apparent
+# physical Y at TABLE_COMFORT_CENTER_HEIGHT_M.
+checkBounds = [-100.0, 100.0, -100.0, 100.0, -100.0, 100.0]
+checkCenter = [0.0, 0.0, 0.0]
+checkRelScale = 1.0
+h = VRStage.VRStageLogic.computeDefaultTableHeightM(baseM, checkRelScale, checkBounds)
+tp = (0.0, h + VRStage.TABLE_TOP_THICKNESS_M, VRStage.TABLE_FORWARD_M)
+ptw = VRStage.VRStageLogic.computePhysicalToWorld(baseM, checkRelScale, 0.0, checkBounds, checkCenter, tp)
+ptwInv = vtk.vtkMatrix4x4()
+vtk.vtkMatrix4x4.Invert(ptw, ptwInv)
+centerPhysical = ptwInv.MultiplyPoint([checkCenter[0], checkCenter[1], checkCenter[2], 1.0])
+assert abs(centerPhysical[1] - VRStage.TABLE_COMFORT_CENTER_HEIGHT_M) < 1e-4, centerPhysical[1]
+print("computeDefaultTableHeightM: OK")
+
 # _frontFacingYawRad: rotation about `up` that spins RAS Anterior to face the physical
 # "toward user" direction. Build an M0 where physical up -> WORLD_UP_RAS (S), physical
 # toward-user -> RAS Right, and physical X -> RAS Anterior (completing a right-handed frame) -
@@ -179,17 +218,19 @@ controlsLogic = VRStage.VRStageLogic()
 defaultControls = controlsLogic.getParameterNode().controls
 assert defaultControls.scaleUp == "B"
 assert defaultControls.scaleDown == "Y"
-assert defaultControls.nextSceneView == "Right Trigger"
-assert defaultControls.prevSceneView == "Left Trigger"
+assert defaultControls.nextSceneView == VRStage.CONTROL_BINDING_UNBOUND
+assert defaultControls.prevSceneView == VRStage.CONTROL_BINDING_UNBOUND
 assert defaultControls.resetFraming == "Left Stick Click"
 assert defaultControls.toggleReformatVisible == "Right Stick Click"
 assert defaultControls.toggleAutoSpin == "Left Menu"
-assert defaultControls.placeMeasurementPoint == "A"
-assert defaultControls.undoMeasurement == "X"
+assert defaultControls.placeMeasurementPoint == "Right Trigger"
+assert defaultControls.undoMeasurement == "Left Trigger"
 print("VRStageControlBindings defaults: OK")
 
 # Every configured button must resolve to a real event name, and (where the real VR interactor
 # style module is importable in this headless environment) a real attribute on that class.
+# CONTROL_BINDING_UNBOUND is a real, selectable Choice value but deliberately has no event (it
+# means "nothing bound") - it's excluded from CONTROL_BINDING_EVENT_NAMES on purpose.
 try:
     import vtkSlicerVirtualRealityModuleMRMLDisplayableManagerPython as vrDM
     _style = vrDM.vtkVirtualRealityViewOpenXRInteractorStyle
@@ -199,19 +240,41 @@ for label, eventName in VRStage.CONTROL_BINDING_EVENT_NAMES.items():
     assert isinstance(label, str) and isinstance(eventName, str)
     if _style is not None:
         assert hasattr(_style, eventName), f"{eventName} (button {label!r}) is not a real controller event"
-assert set(VRStage.CONTROL_BINDING_LABELS) == set(VRStage.CONTROL_BINDING_EVENT_NAMES.keys())
+assert VRStage.CONTROL_BINDING_UNBOUND not in VRStage.CONTROL_BINDING_EVENT_NAMES
+assert set(VRStage.CONTROL_BINDING_LABELS) == set(VRStage.CONTROL_BINDING_EVENT_NAMES.keys()) | {VRStage.CONTROL_BINDING_UNBOUND}
 print("CONTROL_BINDING_EVENT_NAMES: OK" + (" (verified against real interactor style)" if _style else " (interactor style module unavailable, name-shape only)"))
 
-# The generated signage text: one line per action (with its currently-bound button substituted)
-# plus the two fixed lines (rotate, grip) - line COUNT must match HELP_BODY_LINE_COUNT exactly,
-# since that constant drives the panel's derived height (see VRStage.py's HELP_PANEL_HEIGHT_M).
+# The generated signage text: one line per BOUND action (with its currently-bound button
+# substituted), plus the three fixed lines (rotate, grip, roll, table-height) - an Unbound
+# action produces no line (see _controlSchemeBodyText), so HELP_BODY_LINE_COUNT (which assumes
+# every action is bound) is only an upper bound, not an exact match, once
+# nextSceneView/prevSceneView are left Unbound.
 bodyText = VRStage.VRStageLogic._controlSchemeBodyText(defaultControls)
 bodyLines = bodyText.split("\n")
-assert len(bodyLines) == VRStage.HELP_BODY_LINE_COUNT, (len(bodyLines), VRStage.HELP_BODY_LINE_COUNT)
-assert bodyLines[0] == "L-stick: rotate turntable"
-assert bodyLines[-1] == "Either grip (hold): move reformat plane"
+assert len(bodyLines) == VRStage.HELP_BODY_LINE_COUNT - 2, (len(bodyLines), VRStage.HELP_BODY_LINE_COUNT)
+assert bodyLines[0] == "L-stick: rotate/pitch turntable"
+assert bodyLines[-1] == "Left grip (hold) + L-stick U/D: table height"
 assert "B: scale up" in bodyLines
-assert "A: place measurement point" in bodyLines
+assert "Right Trigger: place measurement point" in bodyLines
+assert "Either grip (hold): move reformat plane" in bodyLines
+assert "Left grip (hold) + L-stick L/R: roll" in bodyLines
+assert not any("next scene view" in line for line in bodyLines), "unbound actions must not get a signage line"
+assert not any("previous scene view" in line for line in bodyLines)
+
+# Binding every action (the worst case HELP_BODY_LINE_COUNT is actually sized for) produces
+# exactly HELP_BODY_LINE_COUNT lines, with real lines for the two previously-unbound actions.
+fullyBoundLogic = VRStage.VRStageLogic()
+fullyBoundControls = fullyBoundLogic.getParameterNode().controls
+fullyBoundControls.nextSceneView = "A"
+fullyBoundControls.prevSceneView = "X"
+fullyBoundText = VRStage.VRStageLogic._controlSchemeBodyText(fullyBoundControls)
+fullyBoundLines = fullyBoundText.split("\n")
+assert len(fullyBoundLines) == VRStage.HELP_BODY_LINE_COUNT, (len(fullyBoundLines), VRStage.HELP_BODY_LINE_COUNT)
+assert "A: next scene view" in fullyBoundLines
+assert "X: previous scene view" in fullyBoundLines
+fullyBoundControls.nextSceneView = VRStage.CONTROL_BINDING_UNBOUND  # reset - shared parameter node
+fullyBoundControls.prevSceneView = VRStage.CONTROL_BINDING_UNBOUND
+print("control-scheme signage line budget: OK")
 
 # Rebinding is reflected immediately in the generated text (this is what makes the in-VR sign
 # stay accurate after a user rebinds something, instead of showing stale defaults).
@@ -223,6 +286,143 @@ assert "Left Menu: scale up" in reboundText.split("\n")
 assert "B: scale up" not in reboundText
 rebindControls.scaleUp = "B"  # reset so this doesn't leak into anything else sharing the scene
 print("control-scheme signage text generation: OK")
+
+# ---------------------------------------------------------------- wall tile galleries
+#
+# Left-wall atlas launcher + right-wall scene-view launcher tiles - see VRStage.py's "wall tile
+# galleries" section. Grid/geometry math is pure; _buildSceneViewWallTiles/_buildAtlasWallTiles
+# only need a parameter node + slicer.modules.sceneviews.logic(), not a live VR widget/headset -
+# same "no headset needed" property as the _buildChrome visibility-gating tests above.
+
+# _gridTileOffsets: row-major, centered, stable ordering, and a short last row is itself
+# centered rather than left-aligned.
+offsets3 = VRStage.VRStageLogic._gridTileOffsets(3, 3, 1.0, 1.0, 0.0)
+assert len(offsets3) == 3
+assert [round(u, 6) for u, _v in offsets3] == [-1.0, 0.0, 1.0], offsets3  # single centered row
+assert all(v == 0.0 for _u, v in offsets3)
+
+offsets5 = VRStage.VRStageLogic._gridTileOffsets(5, 3, 1.0, 1.0, 0.0)
+assert len(offsets5) == 5
+firstRowU = [round(u, 6) for u, _v in offsets5[:3]]
+secondRowU = [round(u, 6) for u, _v in offsets5[3:]]
+assert firstRowU == [-1.0, 0.0, 1.0], firstRowU          # full row of 3, centered on 0
+assert secondRowU == [-0.5, 0.5], secondRowU              # short row of 2, centered independently
+assert offsets5[0][1] > offsets5[3][1], "first row must be above (larger v than) the second row"
+
+assert VRStage.VRStageLogic._gridTileOffsets(0, 3, 1.0, 1.0, 0.0) == []
+print("gridTileOffsets: OK")
+
+# _wallTileWorldPosition: fixed X per side (wall inner face + WALL_TILE_PANEL_PROUD_M), mirrored
+# U-sign (du increases toward the wall's own "right" as seen by a user facing it), matching the
+# winding _wallTilePanelActor uses.
+leftX, leftY, leftZ = VRStage.VRStageLogic._wallTileWorldPosition("left", 1.5, -0.5, 0.2, 0.3)
+assert abs(leftX - (-VRStage.ROOM_SIZE_M[0] / 2.0 + VRStage.WALL_TILE_PANEL_PROUD_M)) < 1e-9
+assert abs(leftY - 1.8) < 1e-9
+assert abs(leftZ - (-0.7)) < 1e-9  # centerZ - du
+
+rightX, rightY, rightZ = VRStage.VRStageLogic._wallTileWorldPosition("right", 1.5, -0.5, 0.2, 0.3)
+assert abs(rightX - (VRStage.ROOM_SIZE_M[0] / 2.0 - VRStage.WALL_TILE_PANEL_PROUD_M)) < 1e-9
+assert abs(rightZ - (-0.3)) < 1e-9  # centerZ + du
+assert leftX != rightX
+print("wallTileWorldPosition: OK")
+
+# ATLAS_SPECS: exactly the three AtlasTests atlases, each with the keys _buildAtlasWallTiles and
+# _activateAtlasTile need, and a distinct pictogram color per kind.
+assert len(VRStage.ATLAS_SPECS) == 3
+for spec in VRStage.ATLAS_SPECS:
+    for key in ("name", "kind", "fileNames", "uris", "checksums"):
+        assert key in spec and spec[key], (spec.get("name"), key)
+    texture = VRStage.VRStageLogic._atlasTileTexture(spec["kind"], (0.5, 0.5, 0.5), (0.2, 0.2, 0.2))
+    assert texture.dtype.name == "uint8"
+    assert texture.ndim == 3 and texture.shape[2] == 3
+assert len({spec["kind"] for spec in VRStage.ATLAS_SPECS}) == 3, "each atlas needs a distinct icon"
+print("ATLAS_SPECS: OK")
+
+# _buildAtlasWallTiles: exactly 3 pickable panel actors (+ 3 labels), all registered for picking.
+atlasWallLogic = VRStage.VRStageLogic()
+atlasWallActors = atlasWallLogic._buildAtlasWallTiles()
+assert len(atlasWallActors) == 6, len(atlasWallActors)  # 3 panels + 3 labels
+assert len(atlasWallLogic._wallTileByActor) == 3
+for panelActor in atlasWallLogic._wallTileByActor:
+    assert panelActor.GetPickable(), "atlas tiles must stay pickable"
+print("buildAtlasWallTiles: OK")
+
+# _buildSceneViewWallTiles with zero scene views (nothing created yet at this point in the test
+# file - see the "scene views" section further below) builds one non-interactive placeholder tile
+# instead of leaving the wall blank.
+assert slicer.modules.sceneviews.logic().GetNumberOfSceneViews() == 0
+emptyWallLogic = VRStage.VRStageLogic()
+emptyWallActors = emptyWallLogic._buildSceneViewWallTiles()
+assert len(emptyWallActors) == 2, len(emptyWallActors)  # 1 placeholder panel + 1 label
+assert len(emptyWallLogic._wallTileByActor) == 0, "the placeholder must not be registered as pickable"
+assert emptyWallActors[0].GetPickable() == 0, "the placeholder panel must not be pickable"
+print("buildSceneViewWallTiles (zero views): OK")
+
+# Picking isolation: a PickFromListOn() picker restricted to a "tile" actor must never return a
+# closer "anatomy" actor on the same ray - locks down the mechanism _wallTilePicker depends on to
+# guarantee a wall tile can never be mistaken for anatomy by the (unrestricted) _measurePicker.
+isolationRenderer = vtk.vtkRenderer()
+isolationRenderer.GetActiveCamera().SetClippingRange(0.01, 1000.0)
+
+
+def _isolationTestSphereActor(center):
+    sphereSource = vtk.vtkSphereSource()
+    sphereSource.SetCenter(*center)
+    sphereSource.SetRadius(5.0)
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputConnection(sphereSource.GetOutputPort())
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    return actor
+
+
+tileActor = _isolationTestSphereActor((0.0, 0.0, -20.0))       # closer to the ray origin
+anatomyActor = _isolationTestSphereActor((0.0, 0.0, -100.0))    # farther
+isolationRenderer.AddActor(tileActor)
+isolationRenderer.AddActor(anatomyActor)
+
+restrictedPicker = vtk.vtkCellPicker()
+restrictedPicker.PickFromListOn()
+restrictedPicker.AddPickList(tileActor)
+isolationRayPos = (0.0, 0.0, 0.0)
+isolationOrientation = (0.0, 0.0, 0.0, 1.0)  # WXYZ, angle 0 -> ray points along (0, 0, -1)
+isolationHit = restrictedPicker.Pick3DRay(isolationRayPos, isolationOrientation, isolationRenderer)
+assert isolationHit
+assert restrictedPicker.GetActor() is tileActor, "a pick-list-restricted picker must never return an actor outside its list"
+
+# And the reverse: a picker restricted to the anatomy actor never returns the (closer) tile actor.
+restrictedAnatomyPicker = vtk.vtkCellPicker()
+restrictedAnatomyPicker.PickFromListOn()
+restrictedAnatomyPicker.AddPickList(anatomyActor)
+anatomyHit = restrictedAnatomyPicker.Pick3DRay(isolationRayPos, isolationOrientation, isolationRenderer)
+assert anatomyHit
+assert restrictedAnatomyPicker.GetActor() is anatomyActor
+print("wall tile picking isolation: OK")
+
+
+# No stray measurement on a tile press: with a wall tile hovered, _onPlaceMeasurementPoint must
+# activate the tile and return WITHOUT ever reaching _commitMeasurementPoint - the critical
+# regression this feature must never break (aiming at a wall tile must never create a real
+# vtkMRMLMarkupsLineNode).
+class _PressCalldata:
+    @staticmethod
+    def GetAction():
+        return vtk.vtkEventDataAction.Press
+
+
+dispatchLogic = VRStage.VRStageLogic()
+dispatchCalls = []
+dispatchLogic._hoveredWallTile = VRStage._WallTile(vtk.vtkActor(), lambda: dispatchCalls.append(1))
+dispatchLogic._measurementPendingLineNode = None
+lineNodeCountBefore = len(slicer.util.getNodesByClass("vtkMRMLMarkupsLineNode"))
+
+dispatchLogic._onPlaceMeasurementPoint(None, None, _PressCalldata())
+
+assert dispatchCalls == [1], "the hovered tile's activation callback must fire exactly once"
+assert dispatchLogic._measurementPendingLineNode is None, "a tile press must never arm a measurement"
+lineNodeCountAfter = len(slicer.util.getNodesByClass("vtkMRMLMarkupsLineNode"))
+assert lineNodeCountAfter == lineNodeCountBefore, "a tile press must never create a measurement node"
+print("no stray measurement on tile press: OK")
 
 # ---------------------------------------------------------------- collection
 
@@ -293,6 +493,88 @@ logic.cycleSceneView(+1)
 assert logic._sceneViewIndex != startIndex or logic.sceneViewCount() == 1
 logic.cycleSceneView(-1)
 print("cycleSceneView: OK")
+
+# _restoreSceneViewAtIndex is the shared tail cycleSceneView and the scene-view wall tiles both
+# use - jumping to an explicit, valid index restores it and updates _sceneViewIndex; an
+# out-of-range index is a no-op (never raises, never corrupts _sceneViewIndex).
+restoreLogic = VRStage.VRStageLogic()
+restoreLogic._restoreSceneViewAtIndex(1)
+assert restoreLogic._sceneViewIndex == 1
+restoreLogic._restoreSceneViewAtIndex(999)  # out of range -> ignored
+assert restoreLogic._sceneViewIndex == 1
+restoreLogic._activateSceneViewTile(0)  # same tail, reached the way a wall-tile press would
+assert restoreLogic._sceneViewIndex == 0
+print("restoreSceneViewAtIndex: OK")
+
+# _buildSceneViewWallTiles with a handful of real scene views: one pickable tile per view, each
+# registered for picking, none of them the zero-view placeholder path.
+fewWallLogic = VRStage.VRStageLogic()
+fewWallActors = fewWallLogic._buildSceneViewWallTiles()
+assert len(fewWallLogic._wallTileByActor) == logic.sceneViewCount()
+assert len(fewWallActors) == 2 * logic.sceneViewCount()  # panel + label per tile
+for panelActor in fewWallLogic._wallTileByActor:
+    assert panelActor.GetPickable(), "scene view tiles must stay pickable"
+print("buildSceneViewWallTiles (few views): OK")
+
+# Pagination: create exactly PAGE_SIZE + 2 total scene views, forcing exactly 2 pages (a full
+# first page, a short 2-tile second page) - confirms the wall paginates instead of clamping/
+# growing unbounded, and that Prev/Next enable state and the "Page X / Y" indicator text track
+# the current page correctly.
+while svLogic.GetNumberOfSceneViews() < VRStage.SCENE_VIEW_WALL_PAGE_SIZE + 2:
+    svLogic.CreateSceneView(f"VRStageTestViewExtra{svLogic.GetNumberOfSceneViews()}")
+totalViews = svLogic.GetNumberOfSceneViews()
+assert totalViews == VRStage.SCENE_VIEW_WALL_PAGE_SIZE + 2, totalViews
+pageCount = -(-totalViews // VRStage.SCENE_VIEW_WALL_PAGE_SIZE)  # ceil division
+assert pageCount == 2, pageCount
+
+
+def _navTileTexts(actors, contentTileCount):
+    """The 3 nav tiles (Prev, Page indicator, Next) immediately follow the content tiles, panel
+    then label each - see _buildSceneViewWallNavTiles/_buildSceneViewWallTiles."""
+    navStart = 2 * contentTileCount
+    prevPanel, prevLabel, pagePanel, pageLabel, nextPanel, nextLabel = actors[navStart:navStart + 6]
+    return prevPanel, prevLabel, pagePanel, pageLabel, nextPanel, nextLabel
+
+
+# Page 0 (default): full page of content, Prev disabled, Next enabled.
+page0Logic = VRStage.VRStageLogic()
+page0Actors = page0Logic._buildSceneViewWallTiles()
+assert page0Logic._sceneViewWallPage == 0
+content0 = min(totalViews, VRStage.SCENE_VIEW_WALL_PAGE_SIZE)
+assert len(page0Actors) == 2 * content0 + 2 * 3, len(page0Actors)  # content + 3 nav tiles
+# Registered/pickable: every content tile, plus only whichever of Prev/Next is enabled.
+assert len(page0Logic._wallTileByActor) == content0 + 1, len(page0Logic._wallTileByActor)
+prevPanel0, _prevLabel0, pagePanel0, pageLabel0, nextPanel0, _nextLabel0 = _navTileTexts(page0Actors, content0)
+assert not prevPanel0.GetPickable(), "Prev must be disabled on the first page"
+assert nextPanel0.GetPickable(), "Next must be enabled when a later page exists"
+assert not pagePanel0.GetPickable(), "the page indicator is never interactive"
+assert pageLabel0.GetInput() == "Page 1 / 2", pageLabel0.GetInput()
+print("buildSceneViewWallTiles (page 1 of 2): OK")
+
+# Page 1 (last, short): remaining content, Prev enabled, Next disabled.
+page1Logic = VRStage.VRStageLogic()
+page1Logic._sceneViewWallPage = 1
+page1Actors = page1Logic._buildSceneViewWallTiles()
+content1 = totalViews - VRStage.SCENE_VIEW_WALL_PAGE_SIZE
+assert content1 == 2, content1
+assert len(page1Actors) == 2 * content1 + 2 * 3, len(page1Actors)
+assert len(page1Logic._wallTileByActor) == content1 + 1, len(page1Logic._wallTileByActor)
+prevPanel1, _prevLabel1, pagePanel1, pageLabel1, nextPanel1, _nextLabel1 = _navTileTexts(page1Actors, content1)
+assert prevPanel1.GetPickable(), "Prev must be enabled once off the first page"
+assert not nextPanel1.GetPickable(), "Next must be disabled on the last page"
+assert pageLabel1.GetInput() == "Page 2 / 2", pageLabel1.GetInput()
+print("buildSceneViewWallTiles (page 2 of 2): OK")
+
+# _activateSceneViewWallPage updates the tracked page even with no live VR renderer to rebuild
+# into (_rebuildSceneViewWall is a documented no-op outside VR) - this is what a Next/Prev tile
+# press ultimately calls.
+pageActivateLogic = VRStage.VRStageLogic()
+pageActivateLogic._buildSceneViewWallTiles()
+assert pageActivateLogic._sceneViewWallPage == 0
+pageActivateLogic._activateSceneViewWallPage(1)
+assert pageActivateLogic._sceneViewWallPage == 1
+pageActivateLogic._rebuildSceneViewWall()  # no renderer -> must not raise
+print("scene view wall pagination: OK")
 
 # ---------------------------------------------------------------- measurement tool
 
@@ -389,6 +671,17 @@ missOrientation = (90.0, 0.0, 1.0, 0.0)  # 90 degrees about Y -> ray points alon
 missHit = pickTestPicker.Pick3DRay(rayPos, missOrientation, pickRenderer)
 assert not missHit, "a ray aimed away from both spheres should miss"
 print("Pick3DRay picking mechanics: OK")
+
+# exitViewerMode() idempotency - the headless stand-in for the reentrancy contract
+# _activateAtlasTile relies on (VRStageWidget's own StartCloseEvent observer calls
+# exitViewerMode() a second time, reentrantly, from inside slicer.util.loadScene(); that second
+# call must be a safe no-op). The real network download/scene load is out of scope for a ctest.
+idempotentLogic = VRStage.VRStageLogic()
+idempotentLogic.exitViewerMode()
+assert idempotentLogic.isActive is False
+idempotentLogic.exitViewerMode()  # second call, never having been active - must not raise
+assert idempotentLogic.isActive is False
+print("exitViewerMode idempotency: OK")
 
 slicer.mrmlScene.Clear()
 print("VRStageLogicTest: ALL PASSED")

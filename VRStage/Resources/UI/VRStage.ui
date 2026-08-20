@@ -115,7 +115,39 @@
         </property>
        </widget>
       </item>
-      <item row="2" column="0" colspan="2">
+      <item row="2" column="0">
+       <widget class="QLabel" name="defaultScaleLabel">
+        <property name="text">
+         <string>Default scale:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QDoubleSpinBox" name="defaultScaleSpinBox">
+        <property name="toolTip">
+         <string>Real-world magnification (1.0 = normal VR size) used to frame the data on each reset, when Fit data to table is off.</string>
+        </property>
+        <property name="SlicerParameterName" stdset="0">
+         <string>defaultScale</string>
+        </property>
+        <property name="decimals">
+         <number>2</number>
+        </property>
+        <property name="minimum">
+         <double>0.010000000000000</double>
+        </property>
+        <property name="maximum">
+         <double>100.000000000000000</double>
+        </property>
+        <property name="singleStep">
+         <double>0.100000000000000</double>
+        </property>
+        <property name="value">
+         <double>1.000000000000000</double>
+        </property>
+       </widget>
+      </item>
+      <item row="3" column="0" colspan="2">
        <widget class="QCheckBox" name="fitToTableCheckBox">
         <property name="toolTip">
          <string>Auto-scale the data to span the table on each framing. Off by default so scene views keep a consistent real-world scale.</string>
@@ -131,7 +163,7 @@
         </property>
        </widget>
       </item>
-      <item row="3" column="0" colspan="2">
+      <item row="4" column="0" colspan="2">
        <widget class="QCheckBox" name="overheadLightCheckBox">
         <property name="toolTip">
          <string>Light the table from an overhead fixture near the ceiling, with softer fill lights derived from it, instead of the VR view's default lighting. See Display &gt; Colors for the light's color.</string>
@@ -344,6 +376,38 @@
            </property>
            <property name="SlicerParameterName" stdset="0">
             <string>display.showBackWallSignage</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QCheckBox" name="showAtlasWallCheckBox">
+           <property name="toolTip">
+            <string>Show the left-wall atlas launcher tiles (Abdominal/Brain/Knee) - aim and press to download and load one.</string>
+           </property>
+           <property name="text">
+            <string>Show atlas wall</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+           <property name="SlicerParameterName" stdset="0">
+            <string>display.showAtlasWall</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QCheckBox" name="showSceneViewWallCheckBox">
+           <property name="toolTip">
+            <string>Show the right-wall scene-view launcher tiles - aim and press to switch to that scene view.</string>
+           </property>
+           <property name="text">
+            <string>Show scene view wall</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+           <property name="SlicerParameterName" stdset="0">
+            <string>display.showSceneViewWall</string>
            </property>
           </widget>
          </item>

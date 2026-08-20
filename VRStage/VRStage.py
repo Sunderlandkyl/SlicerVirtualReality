@@ -1,3 +1,4 @@
+import collections
 import logging
 import math
 import time
@@ -13,6 +14,7 @@ from slicer.i18n import tr as _
 from slicer.i18n import translate
 from slicer.ScriptedLoadableModule import *
 from slicer.util import VTKObservationMixin
+from slicer.util import TESTING_DATA_URL
 from slicer.parameterNodeWrapper import (
     parameterNodeWrapper,
     parameterPack,
@@ -57,27 +59,33 @@ are left untouched. The Red/Green/Yellow slice planes are not shown.
 
 Controller bindings (Oculus Touch, defaults shown - nine of these are rebindable in the Controls
 section below, or via `logic.getParameterNode().controls`):
-- Left thumbstick left/right: rotate the turntable (fixed)
+- Left thumbstick left/right: rotate the turntable (yaw); up/down: pitch. Left grip (hold):
+  turns left/right into roll and up/down into table height - see below. (fixed)
 - Either grip (hold): the reformat plane follows that controller's position/orientation for as
   long as the grip is held - release to leave it in place. A floating screen beside the plane
-  shows the reformatted image live. Hidden until toggled on (see below). (fixed)
+  shows the reformatted image live. Hidden until toggled on (see below). The left grip doubles
+  as the roll/table-height modifier above, so holding it does both at once. (fixed)
 - Right thumbstick click: show/hide the reformat plane and its floating screen
 - B button: increase scale, Y button: decrease scale
-- Right/Left trigger: next/previous scene view
-- Left thumbstick click: recenter the data on the table (scale 1.0)
+- A/X: unbound by default (aim at a right-wall tile and pull the right trigger to pick a scene
+  view instead - see below - or rebind next/previous scene view onto A/X in the Controls section)
+- Left thumbstick click: recenter the data on the table (at the default scale, see the Behavior
+  section's "Default scale" - 1.0 = normal VR size, unless "Fit data to table" is on)
 - Left menu button: toggle hands-free auto-spin
-- Right A: aim the right controller at the anatomy (or the revealed reformat plane, for
-  volume-only data) and press to place a measurement point; press again to complete the pair
-  into a persisted distance measurement. Left X: undo the last point or measurement. (aiming with
-  the right controller is fixed; which buttons place/undo is rebindable)
+- Right trigger: aim the right controller at the anatomy (or the revealed reformat plane, for
+  volume-only data) and pull to place a measurement point; pull again to complete the pair into
+  a persisted distance measurement - OR, if the aim ray is over a wall tile instead (the left
+  wall's atlas launcher or the right wall's scene-view launcher), activate that tile. Left
+  trigger: undo the last point or measurement. (aiming with the right controller is fixed; which
+  buttons place/undo is rebindable)
 - Two-controller A+X gesture: freely move/scale/rotate (the room follows) (fixed - independent of
   any rebinding above, since it's a built-in SlicerVR gesture, not one of this module's actions)
 
 Other modules can reuse this room/table setup while customizing its colors and showing/hiding
-individual components (walls, signage, orientation labels, table screen, info screen), disabling
-the reformat/measurement tools, or rebinding which button triggers which action - see
-VRStageDisplayOptions (`logic.getParameterNode().display`) and VRStageControlBindings
-(`logic.getParameterNode().controls`).
+individual components (walls, signage, orientation labels, table screen, info screen, atlas wall,
+scene view wall), disabling the reformat/measurement tools, or rebinding which button triggers
+which action - see VRStageDisplayOptions (`logic.getParameterNode().display`) and
+VRStageControlBindings (`logic.getParameterNode().controls`).
 """)
         self.parent.helpText += self.getDefaultModuleDocumentationLink()
         self.parent.acknowledgementText = _("""
@@ -193,8 +201,22 @@ FLOOR_RADIUS_M = 2.0
 FLOOR_THICKNESS_M = 0.02
 TABLE_RADIUS_M = 0.40
 TABLE_TOP_THICKNESS_M = 0.05
-TABLE_HEIGHT_M = 0.90            # height of the table top above the floor
+TABLE_HEIGHT_M = 0.90            # authored height of the table top above the floor (see below)
 TABLE_FORWARD_M = -0.60         # distance in front of the user (-Z)
+
+# Runtime table height (left grip + left stick up/down) and its data-aware default.
+# TABLE_HEIGHT_M above stays the AUTHORED height all chrome geometry is baked at; the live
+# height (VRStageLogic._tableHeightM) is applied as a physical-space Y offset to the
+# table-anchored props in _reanchorChrome, so nothing is rebuilt while the table moves. The
+# clamp minimum keeps the collar and monitor housing (which occupy the RIM_BAND_HEIGHT_M band
+# below the tabletop, see below) above the floor.
+TABLE_HEIGHT_MIN_M = 0.30
+TABLE_HEIGHT_MAX_M = 1.50
+TABLE_MOVE_SPEED_M_PER_S = 0.30   # table travel speed at full stick deflection
+# Physical height a framing reset places the data's vertical center at: low enough that even
+# small data sits comfortably below eye level, while tall data brings the table down further
+# (clamped to TABLE_HEIGHT_MIN_M) instead of towering overhead off a fixed-height table.
+TABLE_COMFORT_CENTER_HEIGHT_M = 0.80
 COLUMN_RADIUS_M = 0.08
 ROOM_SIZE_M = (6.0, 3.0, 6.0)   # width (X), height (Y), depth (Z)
 ROOM_CENTER_Y_M = 1.5
@@ -245,10 +267,10 @@ FLOOR_RING_OUTER_M = TABLE_RADIUS_M + 0.32
 # that can be freely reassigned to any of this module's button-triggered actions. Deliberately
 # EXCLUDES events that are structural/continuous rather than a simple discrete click:
 #   - LeftThumbstickEvent/RightThumbstickEvent/Right*ThumbstickTouchEvent (continuous axis -
-#     turntable rotation drive, and the suppress-default-fly observers)
+#     turntable rotation/table-height drive, and the suppress-default-fly observers)
 #   - Left/RightGripClickEvent + Left/RightGripPoseEvent (paired continuous pose tracking for
-#     the reformat plane - "either grip" is a fixed structural affordance, not one of the
-#     assignable actions below)
+#     the reformat plane and the roll/table-height modifier - "either grip" is a fixed
+#     structural affordance, not one of the assignable actions below)
 #   - RightAimPoseEvent (continuous aim ray for the measurement reticle)
 #   - RightSystemClickEvent (reserved for the platform/system menu on most runtimes)
 # Labels use the physical button printed on an Oculus Touch controller where one exists (A/B on
@@ -265,7 +287,13 @@ CONTROL_BINDING_EVENT_NAMES = {
     "Right Trigger": "RightTriggerClickEvent",
     "Right Stick Click": "RightThumbstickClickEvent",
 }
-CONTROL_BINDING_LABELS = list(CONTROL_BINDING_EVENT_NAMES.keys())
+# Sentinel Choice value meaning "no button triggers this action" - a real, selectable option in
+# the Controls UI's combo boxes (not just an implementation detail), so an action can be
+# deliberately left with nothing bound (see nextSceneView/prevSceneView's defaults below, freed
+# up now that the right-wall scene-view tiles cover scene selection). Deliberately NOT a key in
+# CONTROL_BINDING_EVENT_NAMES (it has no event) - addAction/_controlSchemeBodyText special-case it.
+CONTROL_BINDING_UNBOUND = "Unbound"
+CONTROL_BINDING_LABELS = [CONTROL_BINDING_UNBOUND] + list(CONTROL_BINDING_EVENT_NAMES.keys())
 
 # The module's nine button-triggered actions, in the order they're listed in the Controls UI
 # section and generated into the back-wall signage's control-scheme text, paired with a short
@@ -302,7 +330,12 @@ HELP_PANEL_CENTER_Y_M = ROOM_CENTER_Y_M + 0.35
 HELP_PANEL_WIDTH_M = 2.4
 HELP_TITLE_HEIGHT_M = 0.14
 HELP_BODY_HEIGHT_M = 0.085
-HELP_BODY_LINE_COUNT = 1 + len(CONTROL_ACTION_ORDER) + 1  # rotate line + one per action + grip line
+HELP_BODY_LINE_COUNT = 1 + len(CONTROL_ACTION_ORDER) + 3  # rotate line + one per action + grip
+                                                           # line + roll line + table-height line
+                                                           # - worst
+                                                           # case (every action bound); an
+                                                           # Unbound one produces no line, see
+                                                           # _controlSchemeBodyText
 HELP_TITLE_BODY_GAP_M = 0.05      # deliberate breathing room between title and body
 HELP_PANEL_TEXT_MARGIN_M = 0.05   # from the usable (border-excluded) interior edge to the text
 HELP_PANEL_BORDER_FRAC = 0.05     # must match _signagePanelTexture's default borderFrac
@@ -436,11 +469,84 @@ DEFAULT_MAGNIFICATION = 1.0
 # SlicerVR convention: magnification = 1000 / physicalScale.
 UNIT_MAGNIFICATION_SCALE = 1000.0
 
-THUMBSTICK_DEADZONE = 0.15
+THUMBSTICK_DEADZONE = 0.25
 INPUT_TIMER_INTERVAL_MS = 33  # ~30 Hz continuous-input update (turntable)
 AUTO_SPIN_DEG_PER_SEC = 30.0    # hands-free presentation rotation speed
 
 SLICE_NODE_IDS = ["vtkMRMLSliceNodeRed", "vtkMRMLSliceNodeGreen", "vtkMRMLSliceNodeYellow"]
+
+# Left/right wall launcher tiles: the left wall holds a fixed set of "load this atlas" tiles
+# (ATLAS_SPECS, one press downloads+loads that atlas scene - see _buildAtlasWallTiles), the right
+# wall holds one tile per Scene View in the current scene, built fresh at chrome-build time
+# (_buildSceneViewWallTiles). Both walls share the same tile-panel geometry (_wallTilePanelActor/
+# _wallTileLabelActor/_gridTileOffsets/_wallTileWorldPosition) and the same aim-ray-pick +
+# button-press activation machinery (_wallTilePicker/_wallTileByActor/_hoveredWallTile) - see the
+# "wall tile galleries" section further down for the picking/dispatch design.
+WALL_TILE_WIDTH_M = 0.55
+WALL_TILE_HEIGHT_M = 0.55
+WALL_TILE_GUTTER_M = 0.12
+WALL_TILE_LABEL_HEIGHT_M = 0.045
+WALL_TILE_LABEL_MARGIN_M = 0.03
+# Proud-of-wall offsets for the tile panel/text, same z-fighting reasoning as
+# BACK_WALL_PANEL_OFFSET_M/BACK_WALL_TEXT_OFFSET_M (side walls are a comparable ~3m from the user).
+WALL_TILE_PANEL_PROUD_M = 0.20
+WALL_TILE_TEXT_PROUD_M = 0.24
+WALL_TILE_HOVER_COLOR = ACCENT_COLOR
+WALL_TILE_NORMAL_COLOR = (1.0, 1.0, 1.0)
+
+ATLAS_WALL_COLUMNS = 3
+ATLAS_WALL_CENTER_Y_M = ROOM_CENTER_Y_M
+ATLAS_WALL_CENTER_Z_M = TABLE_FORWARD_M
+
+SCENE_VIEW_WALL_COLUMNS = 3
+SCENE_VIEW_WALL_MAX_ROWS = 3
+SCENE_VIEW_WALL_PAGE_SIZE = SCENE_VIEW_WALL_COLUMNS * SCENE_VIEW_WALL_MAX_ROWS  # tiles per page
+SCENE_VIEW_WALL_CENTER_Y_M = ROOM_CENTER_Y_M
+SCENE_VIEW_WALL_CENTER_Z_M = TABLE_FORWARD_M
+# Prev/page-indicator/Next row below the content grid, shown only when there's more than one page
+# (see _buildSceneViewWallNavTiles). Sized from SCENE_VIEW_WALL_MAX_ROWS (the full page height),
+# not the current page's actual row count, so the nav row sits at the same place on every page -
+# including a short last page - rather than jumping up to hug a partially-filled grid.
+SCENE_VIEW_WALL_CONTENT_HEIGHT_M = (
+    SCENE_VIEW_WALL_MAX_ROWS * (WALL_TILE_HEIGHT_M + WALL_TILE_GUTTER_M) - WALL_TILE_GUTTER_M)
+SCENE_VIEW_WALL_NAV_GAP_M = WALL_TILE_GUTTER_M
+SCENE_VIEW_WALL_NAV_ROW_DV_M = (
+    -SCENE_VIEW_WALL_CONTENT_HEIGHT_M / 2.0 - SCENE_VIEW_WALL_NAV_GAP_M - WALL_TILE_HEIGHT_M / 2.0)
+
+# The three atlases from Slicer's own AtlasTests self-test module (Applications/SlicerApp/
+# Testing/Python/AtlasTests.py in Slicer core - not part of this extension) - same fixed
+# name/download parameters, reused here as one-press "load this atlas" wall tiles instead of
+# AtlasTests' plain desktop buttons. "kind" picks which procedural pictogram _atlasTileTexture
+# draws (there is no real preview image for any of these three - see ATLAS_ICON_COLORS).
+ATLAS_SPECS = [
+    {
+        "name": "Abdominal Atlas", "kind": "abdominal",
+        "fileNames": "Abdominal_Atlas_2012.mrb",
+        "uris": TESTING_DATA_URL + "SHA256/5d315abf7d303326669c6075f9eea927eeda2e531a5b1662cfa505806cb498ea",
+        "checksums": "SHA256:5d315abf7d303326669c6075f9eea927eeda2e531a5b1662cfa505806cb498ea",
+    },
+    {
+        "name": "Brain Atlas", "kind": "brain",
+        "fileNames": "BrainAtlas2012.mrb",
+        "uris": TESTING_DATA_URL + "SHA256/688ebcc6f45989795be2bcdc6b8b5bfc461f1656d677ed3ddef8c313532687f1",
+        "checksums": "SHA256:688ebcc6f45989795be2bcdc6b8b5bfc461f1656d677ed3ddef8c313532687f1",
+    },
+    {
+        "name": "Knee Atlas", "kind": "knee",
+        "fileNames": "KneeAtlas2012.mrb",
+        "uris": TESTING_DATA_URL + "SHA256/5d5506c07c238918d0c892e7b04c26ad7f43684d89580780bb207d1d860b0b33",
+        "checksums": "SHA256:5d5506c07c238918d0c892e7b04c26ad7f43684d89580780bb207d1d860b0b33",
+    },
+]
+ATLAS_ICON_COLORS = {
+    "abdominal": (0.85, 0.55, 0.25),  # warm amber
+    "brain": (0.65, 0.35, 0.95),      # violet
+    "knee": (0.35, 0.85, 0.45),       # green
+}
+
+# A built wall tile: its pickable panel actor (registered in _wallTileByActor/_wallTilePicker)
+# and the zero-arg callback its activation runs (see _onPlaceMeasurementPoint/_activateWallTile).
+_WallTile = collections.namedtuple("_WallTile", ["actor", "onActivate"])
 
 # Arbitrary reformat slice: a plain model-node plane that follows a controller's pose for as
 # long as its grip is held (_trackReformatPlaneToController), driving a dedicated, non-layout
@@ -510,6 +616,9 @@ class VRStageDisplayOptions:
     showTableScreen: bool = True        # the holo readout inset in the tabletop
     showInfoScreen: bool = True         # the scale/scene-view monitor mounted on the table's collar
     showOrientationLabels: bool = True  # R/L/A/P/S/I billboards
+    showAtlasWall: bool = True          # left-wall atlas-launcher tiles (see ATLAS_SPECS)
+    showSceneViewWall: bool = True      # right-wall scene-view-launcher tiles (built from the
+                                         # scene's current Scene Views at enter time)
 
     enableReformatTool: bool = True
     enableMeasurementTool: bool = True
@@ -522,40 +631,51 @@ class VRStageControlBindings:
     action list/descriptions. Exposed so a user (or another module) can rebind the default
     layout, e.g. to avoid a clash with a button that module's own tooling also wants to use.
 
-    Defaults reproduce the module's original fixed bindings exactly. Rebinding only takes effect
-    on the next enterViewerMode() call (observers are installed once per enter, like the rest of
-    this module's options) - not live while already active.
+    Rebinding only takes effect on the next enterViewerMode() call (observers are installed once
+    per enter, like the rest of this module's options) - not live while already active.
 
     Nothing prevents two actions from being assigned to the same button: both fire on press,
     which is rarely useful but not prevented, since validating uniqueness across nine
     independent combo boxes was judged not worth the added UI complexity.
 
-    Rebinding placeMeasurementPoint/undoMeasurement away from their A/X defaults also loosens
-    the debounce in _isButton1PressSuppressed, which exists specifically to avoid a spurious
-    place/undo when the built-in two-controller free-gesture (always tied to the literal A+X
-    buttons, independent of this pack) is engaged - see that method's docstring.
+    placeMeasurementPoint/undoMeasurement default to the triggers rather than A/X: both are
+    "picking" actions - aim and pull to place a markup point on the anatomy, or to activate
+    whichever wall tile (atlas launcher or scene-view launcher) the aim ray is currently over -
+    and a trigger pull is the natural gesture for that, on either controller. Rebinding
+    placeMeasurementPoint/undoMeasurement onto A/X (no longer the default) engages the debounce
+    in _isButton1PressSuppressed, which exists specifically to avoid a spurious place/undo when
+    the built-in two-controller free-gesture (always tied to the literal A+X buttons, independent
+    of this pack) is engaged - see that method's docstring.
+
+    nextSceneView/prevSceneView are Unbound (CONTROL_BINDING_UNBOUND) by default - freed up now
+    that the right-wall scene-view tiles cover scene selection (aim + pick a specific view,
+    rather than blindly cycling next/prev). A user who still wants the old cycling behavior can
+    rebind either onto any free button in the Controls UI.
     """
 
     scaleUp: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "B"
     scaleDown: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Y"
-    nextSceneView: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Right Trigger"
-    prevSceneView: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Left Trigger"
+    nextSceneView: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = CONTROL_BINDING_UNBOUND
+    prevSceneView: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = CONTROL_BINDING_UNBOUND
     resetFraming: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Left Stick Click"
     toggleReformatVisible: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Right Stick Click"
     toggleAutoSpin: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Left Menu"
-    placeMeasurementPoint: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "A"
-    undoMeasurement: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "X"
+    placeMeasurementPoint: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Right Trigger"
+    undoMeasurement: Annotated[str, Choice(CONTROL_BINDING_LABELS)] = "Left Trigger"
 
 
 @parameterNodeWrapper
 class VRStageParameterNode:
     """User-facing options for the VR Stage.
 
-    rotationSpeedDegPerSec - turntable angular speed at full thumbstick deflection.
+    rotationSpeedDegPerSec - angular speed at full thumbstick deflection, shared by all three
+        rotation axes (yaw/pitch/roll - see VRStageLogic's "turntable rotation" section).
     magnificationStep - multiplicative factor applied to world scale per +/- button press.
+    defaultScale - real-world magnification (1.0 = normal VR size) used to frame the data when
+        fitToTable is off. Ignored while fitToTable is on, which computes its own framing scale.
     fitToTable - if true, auto-scale each framing so the data spans the table. Off by default:
         with it on, different scene views (with different data extents) land at very different
-        scales; off, every framing uses the same real-world scale (1.0 = normal VR size).
+        scales; off, every framing uses defaultScale (1.0 = normal VR size, by default).
     overheadLight - if true, the table is lit by a light rig anchored above it (with softer
         fill lights derived from it) instead of the VR view's default lighting.
     display - colors and component show/hide options - see VRStageDisplayOptions.
@@ -564,13 +684,14 @@ class VRStageParameterNode:
 
     rotationSpeedDegPerSec: Annotated[float, WithinRange(1.0, 360.0)] = 180.0
     magnificationStep: Annotated[float, WithinRange(1.01, 4.0)] = 1.25
+    defaultScale: Annotated[float, WithinRange(MIN_MAGNIFICATION, MAX_MAGNIFICATION)] = DEFAULT_MAGNIFICATION
     fitToTable: bool = False
     overheadLight: bool = True
     display: VRStageDisplayOptions = VRStageDisplayOptions()
     controls: VRStageControlBindings = VRStageControlBindings()
 
 
-class VRStageLogic(ScriptedLoadableModuleLogic):
+class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     """All VR Stage behavior.
 
     The viewer is entirely non-destructive to the MRML scene: placement, scale and turntable
@@ -582,13 +703,13 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
 
     def __init__(self) -> None:
         ScriptedLoadableModuleLogic.__init__(self)
+        VTKObservationMixin.__init__(self)
         self._parameterNode = None
 
         self.isActive = False
 
         # Runtime VR handles (only valid while active).
         self._interactor = None
-        self._observerTags = []
         self._rightStickPosTag = None
         self._rightStickTouchTag = None
         self._physicalToWorldConnected = False
@@ -600,6 +721,8 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         self._sceneViewTextActor = None
         self._monitorAssembly = None
         self._anchorMatrix = vtk.vtkMatrix4x4()
+        self._tableAnchorMatrix = vtk.vtkMatrix4x4()
+        self._tableHeightM = TABLE_HEIGHT_M
 
         # Table screen (the holo-readout inset): anchored like the rest of the chrome, but also
         # carries its own extra spin - see _updateTableScreenOrientation - so its texture visibly
@@ -633,8 +756,11 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         self._savedDolly = None
         self._savedGrab = None
 
-        # Continuous inputs (applied on a timer): left-stick rotate.
+        # Continuous inputs (applied on a timer): left-stick rotate (X = yaw, or roll while the
+        # left grip modifier is held; Y = pitch, or table height while the grip is held - see
+        # _onInputTimer).
         self._leftStickX = 0.0
+        self._leftStickY = 0.0
         self._autoSpin = False
         self._inputTimer = qt.QTimer()
         self._inputTimer.setInterval(INPUT_TIMER_INTERVAL_MS)
@@ -672,6 +798,23 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         self._measureFlashRemaining = 0.0           # seconds left in the "nothing to act on" flash
         self._button1Held = {"Left": False, "Right": False}
         self._button1PressTime = {"Left": None, "Right": None}
+
+        # Wall tile galleries (left wall: atlas launcher, right wall: scene-view launcher - see
+        # ATLAS_SPECS/_buildAtlasWallTiles/_buildSceneViewWallTiles). Tile panels are the one
+        # exception to "every VRStage chrome actor calls PickableOff()" - _wallTilePicker's pick
+        # list contains only these, so they can never be mistaken for anatomy by _measurePicker's
+        # unrestricted pick, and vice versa - see _onRightAimPose/_onPlaceMeasurementPoint.
+        self._wallTilePicker = None                  # vtkCellPicker, PickFromListOn(), tiles only
+        self._wallTileByActor = {}                   # {panel vtkActor: _WallTile}
+        self._hoveredWallTile = None                 # currently aim-hovered _WallTile, or None
+
+        # Scene-view wall pagination: which page is currently shown (0-based, reset to 0 on every
+        # _buildChrome) and the actors currently representing that wall specifically - tracked
+        # separately from self._chromeProps/self._wallTileByActor as a whole so a page change can
+        # rebuild just this wall in place (see _rebuildSceneViewWall) without exiting/re-entering
+        # VR or touching the atlas wall/rest of the room.
+        self._sceneViewWallPage = 0
+        self._sceneViewWallActors = []
 
     def getParameterNode(self):
         parameterNode = super().getParameterNode()
@@ -769,8 +912,10 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         self._magnification = DEFAULT_MAGNIFICATION
         self._autoSpin = False
         self._leftStickX = 0.0
+        self._leftStickY = 0.0
         self._reformatGripHeldSide = None
         self._reformatVisible = False
+        self._tableHeightM = TABLE_HEIGHT_M
 
         self._buildChrome(renderer)
         self._buildLighting(renderer)
@@ -801,6 +946,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
 
         self._inputTimer.stop()
         self._leftStickX = 0.0
+        self._leftStickY = 0.0
 
         self._removeObservers()
 
@@ -880,10 +1026,10 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
             color=accentColor, opacity=0.85)
 
         column = self._discActor(
-            center=(0.0, TABLE_HEIGHT_M / 2.0, TABLE_FORWARD_M),
-            radius=COLUMN_RADIUS_M, height=TABLE_HEIGHT_M, color=columnColor)
+            center=(0.0, TABLE_HEIGHT_M - TABLE_HEIGHT_MAX_M / 2.0, TABLE_FORWARD_M),
+            radius=COLUMN_RADIUS_M, height=TABLE_HEIGHT_MAX_M, color=columnColor)
         columnBand = self._glowRingActor(
-            center=(tableCenterXZ[0], TABLE_HEIGHT_M * 0.30, tableCenterXZ[1]),
+            center=(tableCenterXZ[0], TABLE_HEIGHT_M - RIM_BAND_HEIGHT_M - 0.10, tableCenterXZ[1]),
             innerRadius=0.0, outerRadius=COLUMN_RADIUS_M * 1.02,
             color=accentColorDim, opacity=0.9)
 
@@ -954,31 +1100,46 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
             outerRadius=RIM_BAND_RADIUS_M * COLLAR_SEAM_RING_OUTER_FRAC,
             color=accentColorDim, opacity=0.75)
 
-        self._chromeProps = [
-            floor, floorGrid, floorRing,
+        tableProps = [
             column, columnBand, collar,
             tableTopRing, tableWellFloor, collarSeamRing,
         ]
-        self._chromeProps.extend(tableScreenProps)
+        tableProps.extend(tableScreenProps)
+        roomProps = [floor, floorGrid, floorRing]
 
         if display.showWalls:
-            self._chromeProps.append(self._roomActor(
+            roomProps.append(self._roomActor(
                 wallColor, self._arrayToTexture(self._wallPanelTexture(wallColor))))
-            self._chromeProps.append(self._ceilingLightActor(columnColor, overheadLightColor))
+            roomProps.append(self._ceilingLightActor(columnColor, overheadLightColor))
         if display.showBackWallSignage:
-            self._chromeProps.extend(self._backWallSignageActors(display, params.controls))
+            roomProps.extend(self._backWallSignageActors(display, params.controls))
 
         if display.showInfoScreen:
             self._monitorAssembly = self._buildMonitorAssembly(display)
-            self._chromeProps.append(self._monitorAssembly)
+            tableProps.append(self._monitorAssembly)
         else:
             self._monitorAssembly = None
             self._scaleTextActor = None
             self._sceneViewTextActor = None
 
+        if display.showAtlasWall:
+            roomProps.extend(self._buildAtlasWallTiles())
+        self._sceneViewWallPage = 0
+        if display.showSceneViewWall:
+            self._sceneViewWallActors = self._buildSceneViewWallTiles()
+            roomProps.extend(self._sceneViewWallActors)
+        else:
+            self._sceneViewWallActors = []
+
+        for prop in tableProps:
+            prop.SetUserMatrix(self._tableAnchorMatrix)
+        for prop in roomProps:
+            prop.SetUserMatrix(self._anchorMatrix)
+        self._chromeProps = tableProps + roomProps
         for prop in self._chromeProps:
-            prop.SetUserMatrix(self._anchorMatrix)  # shared matrix, updated by _reanchorChrome
             renderer.AddViewProp(prop)
+
+        self._rebuildWallTilePicker()
 
         if display.showOrientationLabels:
             self._buildOrientationLabels(renderer, accentColor)
@@ -1006,12 +1167,21 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         """The back-wall signage's control-scheme text, generated from the current button
         bindings (see CONTROL_ACTION_ORDER/VRStageControlBindings) rather than hardcoded, so
         the in-VR sign always reflects whatever the user actually configured - not necessarily
-        the module's original defaults. "Either grip" stays a fixed line since it isn't one of
-        the rebindable actions (see the CONTROL_BINDING_EVENT_NAMES module docstring)."""
-        lines = ["L-stick: rotate turntable"]
+        the module's original defaults. "Either grip"/"Left grip" stay fixed lines since neither
+        is one of the rebindable actions (see the CONTROL_BINDING_EVENT_NAMES module docstring).
+        An action left Unbound (see CONTROL_BINDING_UNBOUND) has nothing useful to tell the user,
+        so its line is omitted rather than printed as "Unbound: <description>" - this is why
+        HELP_BODY_LINE_COUNT (the panel-sizing budget, assuming every action IS bound) is only an
+        upper bound on the actual line count, not an exact match."""
+        lines = ["L-stick: rotate/pitch turntable"]
         for fieldName, description in CONTROL_ACTION_ORDER:
-            lines.append(f"{getattr(controls, fieldName)}: {description}")
+            binding = getattr(controls, fieldName)
+            if binding == CONTROL_BINDING_UNBOUND:
+                continue
+            lines.append(f"{binding}: {description}")
         lines.append("Either grip (hold): move reformat plane")
+        lines.append("Left grip (hold) + L-stick L/R: roll")
+        lines.append("Left grip (hold) + L-stick U/D: table height")
         return "\n".join(lines)
 
     @staticmethod
@@ -1166,6 +1336,367 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         self._monitorAssembly = None
         self._turntableAngleRad = 0.0
         self._teardownOrientationLabels()
+        # The tile actors themselves are already gone via the self._chromeProps loop above - just
+        # drop the picking bookkeeping that pointed at them.
+        self._wallTilePicker = None
+        self._wallTileByActor = {}
+        self._hoveredWallTile = None
+        self._sceneViewWallPage = 0
+        self._sceneViewWallActors = []
+
+    # ------------------------------------------------------------------ wall tile galleries
+    #
+    # Two walls of one-press tiles: the left wall is a fixed set of "load this atlas" tiles
+    # (ATLAS_SPECS); the right wall is one tile per Scene View currently in the scene (0..N,
+    # rebuilt fresh every enterViewerMode() call, paginated SCENE_VIEW_WALL_PAGE_SIZE at a time -
+    # see _buildSceneViewWallNavTiles/_rebuildSceneViewWall). Both walls share the same
+    # grid-layout math, the same textured-panel-plus-label construction, and the same
+    # aim-ray-pick + button-press activation machinery.
+    #
+    # Picking: tile panels are the one exception to "every VRStage chrome actor calls
+    # PickableOff()" (see the measurement tool's picking invariant below) - so they get their own
+    # dedicated, pick-list-restricted picker (_wallTilePicker) instead of relying on that
+    # invariant. _onRightAimPose checks this picker FIRST every frame; only when it misses does
+    # the existing (unrestricted) anatomy _measurePicker get a turn - see that method for why this
+    # ordering guarantees a tile can never be mistaken for anatomy (and vice versa).
+
+    @staticmethod
+    def _gridTileOffsets(count, columns, tileWidth, tileHeight, gutter):
+        """Row-major grid of `count` tiles, `columns` wide, centered on (0, 0) in an abstract
+        (u, v) plane - a short last row is itself horizontally centered, not left-aligned.
+        Returns `count` (u, v) tuples in the same order as the caller's tile-spec list; the
+        caller must zip them 1:1."""
+        if count <= 0:
+            return []
+        rows = (count + columns - 1) // columns
+        cellW, cellH = tileWidth + gutter, tileHeight + gutter
+        gridHeight = rows * cellH - gutter
+        topV = gridHeight / 2.0
+        offsets = []
+        for i in range(count):
+            row, col = divmod(i, columns)
+            colsInRow = min(columns, count - row * columns)
+            rowWidth = colsInRow * cellW - gutter
+            rowLeftU = -rowWidth / 2.0
+            u = rowLeftU + col * cellW + tileWidth / 2.0
+            v = topV - row * cellH - tileHeight / 2.0
+            offsets.append((u, v))
+        return offsets
+
+    @staticmethod
+    def _wallTileWorldPosition(side, centerY, centerZ, du, dv):
+        """side is "left" or "right". Maps a grid-local (du, dv) offset (du = horizontal, as the
+        user sees the wall; dv = vertical) to a world (x, y, z) tile center - x is fixed per side
+        (the wall's inner face plus WALL_TILE_PANEL_PROUD_M), matching the U-axis convention used
+        by _wallTilePanelActor's plane geometry."""
+        y = centerY + dv
+        if side == "left":
+            return (-ROOM_SIZE_M[0] / 2.0 + WALL_TILE_PANEL_PROUD_M, y, centerZ - du)
+        return (ROOM_SIZE_M[0] / 2.0 - WALL_TILE_PANEL_PROUD_M, y, centerZ + du)
+
+    @staticmethod
+    def _wallTilePanelActor(side, x, y, z, width, height, texture):
+        """The tile's pickable background panel: a plane in the Y-Z plane (side walls, unlike
+        every other textured panel in this file, which lies in the X-Y plane at a fixed Z) whose
+        winding is chosen so the texture reads un-mirrored for a user standing near the table
+        looking at that wall - see the "wall tile galleries" section docstring above."""
+        halfW, halfH = width / 2.0, height / 2.0
+        source = vtk.vtkPlaneSource()
+        if side == "left":
+            source.SetOrigin(x, y - halfH, z + halfW)
+            source.SetPoint1(x, y - halfH, z - halfW)
+            source.SetPoint2(x, y + halfH, z + halfW)
+        else:
+            source.SetOrigin(x, y - halfH, z - halfW)
+            source.SetPoint1(x, y - halfH, z + halfW)
+            source.SetPoint2(x, y + halfH, z - halfW)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(source.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetTexture(texture)
+        prop = actor.GetProperty()
+        prop.SetColor(*WALL_TILE_NORMAL_COLOR)
+        prop.SetAmbient(0.9)
+        prop.SetDiffuse(0.1)
+        prop.BackfaceCullingOff()
+        # Deliberately left Pickable (default) - this is the one chrome actor type meant to be
+        # hit by a controller aim ray, see the "wall tile galleries" section docstring.
+        return actor
+
+    @staticmethod
+    def _wallTileLabelActor(side, y, z, height, text, color=(0.9, 0.95, 1.0)):
+        """The tile's name label, held WALL_TILE_TEXT_PROUD_M proud of the wall (a bit further
+        than the panel's WALL_TILE_PANEL_PROUD_M, avoiding z-fighting - same reasoning as
+        BACK_WALL_TEXT_OFFSET_M vs. BACK_WALL_PANEL_OFFSET_M) and rotated to face into the room -
+        vtkTextActor3D faces +Z by default, side-wall tiles need it facing +/-X instead."""
+        if side == "left":
+            labelX = -ROOM_SIZE_M[0] / 2.0 + WALL_TILE_TEXT_PROUD_M
+            orientationDeg = (0.0, 90.0, 0.0)
+        else:
+            labelX = ROOM_SIZE_M[0] / 2.0 - WALL_TILE_TEXT_PROUD_M
+            orientationDeg = (0.0, -90.0, 0.0)
+        actor = VRStageLogic._textActor(
+            (labelX, y - height / 2.0 + WALL_TILE_LABEL_MARGIN_M, z),
+            WALL_TILE_LABEL_HEIGHT_M, color=color, orientationDeg=orientationDeg)
+        actor.SetInput(text)
+        return actor
+
+    @staticmethod
+    def _atlasTileTexture(kind, bgColor, borderColor, size=512):
+        """Atlas tile background: _signagePanelTexture's bordered panel, plus a simple colored
+        pictogram (a circle) so the three atlas tiles are visually distinct at a glance. There is
+        no real preview image for any of these three atlases anywhere (AtlasTests itself has
+        none, and downloading a whole atlas just to render its thumbnail would defeat the point
+        of a lightweight preview) - so this is a stand-in icon, not a data screenshot."""
+        img = VRStageLogic._signagePanelTexture(bgColor, borderColor, size=size)
+        iconColor = np.array(ATLAS_ICON_COLORS.get(kind, ACCENT_COLOR)) * 255.0
+        center = size // 2
+        radius = int(size * 0.22)
+        yy, xx = np.ogrid[:size, :size]
+        mask = (xx - center) ** 2 + (yy - int(size * 0.4)) ** 2 <= radius ** 2
+        img[mask] = iconColor.astype(np.uint8)
+        return img
+
+    def _buildAtlasWallTiles(self):
+        """Left wall: one fixed tile per ATLAS_SPECS entry. Pressing a tile downloads+loads that
+        atlas (see _activateAtlasTile), replacing the current scene."""
+        display = self.getParameterNode().display
+        bgColor = _rgbF(display.wallColor)
+        borderColor = _rgbF(display.accentColor)
+        offsets = self._gridTileOffsets(
+            len(ATLAS_SPECS), ATLAS_WALL_COLUMNS, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M,
+            WALL_TILE_GUTTER_M)
+        actors = []
+        for atlasSpec, (du, dv) in zip(ATLAS_SPECS, offsets):
+            x, y, z = self._wallTileWorldPosition(
+                "left", ATLAS_WALL_CENTER_Y_M, ATLAS_WALL_CENTER_Z_M, du, dv)
+            texture = self._arrayToTexture(self._atlasTileTexture(atlasSpec["kind"], bgColor, borderColor))
+            panel = self._wallTilePanelActor(
+                "left", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
+            label = self._wallTileLabelActor("left", y, z, WALL_TILE_HEIGHT_M, atlasSpec["name"])
+            self._wallTileByActor[panel] = _WallTile(
+                panel, (lambda spec=atlasSpec: self._activateWallTile(
+                    lambda s=spec: self._activateAtlasTile(s))))
+            actors.extend([panel, label])
+        return actors
+
+    def _buildSceneViewWallTiles(self):
+        """Right wall: one tile per Scene View currently in the scene (data-driven, 0..N),
+        SCENE_VIEW_WALL_PAGE_SIZE at a time - see _buildSceneViewWallNavTiles for the Prev/Next
+        controls when there's more than one page. Pressing a content tile restores that scene
+        view (see _activateSceneViewTile). With zero scene views, a single non-interactive
+        placeholder tile is built instead of leaving the wall blank."""
+        display = self.getParameterNode().display
+        bgColor = _rgbF(display.wallColor)
+        borderColor = _rgbF(display.accentColor)
+        logic = self._sceneViewsLogic()
+        totalCount = logic.GetNumberOfSceneViews() if logic is not None else 0
+
+        actors = []
+        if totalCount <= 0:
+            self._sceneViewWallPage = 0
+            texture = self._arrayToTexture(self._signagePanelTexture(bgColor, borderColor))
+            x, y, z = self._wallTileWorldPosition(
+                "right", SCENE_VIEW_WALL_CENTER_Y_M, SCENE_VIEW_WALL_CENTER_Z_M, 0.0, 0.0)
+            panel = self._wallTilePanelActor(
+                "right", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
+            panel.PickableOff()  # placeholder only - not a real, activatable tile
+            label = self._wallTileLabelActor(
+                "right", y, z, WALL_TILE_HEIGHT_M, _("No scene views saved"))
+            return [panel, label]
+
+        pageCount = math.ceil(totalCount / SCENE_VIEW_WALL_PAGE_SIZE)
+        # Clamp defensively (e.g. the scene lost views since the page was last set) rather than
+        # producing an out-of-range, empty page.
+        self._sceneViewWallPage = max(0, min(self._sceneViewWallPage, pageCount - 1))
+        startIndex = self._sceneViewWallPage * SCENE_VIEW_WALL_PAGE_SIZE
+        count = min(totalCount - startIndex, SCENE_VIEW_WALL_PAGE_SIZE)
+
+        offsets = self._gridTileOffsets(
+            count, SCENE_VIEW_WALL_COLUMNS, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M,
+            WALL_TILE_GUTTER_M)
+        for i, (du, dv) in enumerate(offsets):
+            index = startIndex + i
+            x, y, z = self._wallTileWorldPosition(
+                "right", SCENE_VIEW_WALL_CENTER_Y_M, SCENE_VIEW_WALL_CENTER_Z_M, du, dv)
+            screenshot = logic.GetNthSceneViewScreenshot(index)
+            if screenshot is not None and screenshot.GetDimensions()[0] > 1:
+                texture = vtk.vtkTexture()
+                texture.SetInputData(screenshot)
+                texture.InterpolateOn()
+            else:
+                texture = self._arrayToTexture(self._signagePanelTexture(bgColor, borderColor))
+            panel = self._wallTilePanelActor(
+                "right", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
+            name = logic.GetNthSceneViewName(index) or _("(unnamed)")
+            label = self._wallTileLabelActor("right", y, z, WALL_TILE_HEIGHT_M, name)
+            self._wallTileByActor[panel] = _WallTile(
+                panel, (lambda i=index: self._activateWallTile(
+                    lambda idx=i: self._activateSceneViewTile(idx))))
+            actors.extend([panel, label])
+
+        if pageCount > 1:
+            actors.extend(self._buildSceneViewWallNavTiles(pageCount))
+        return actors
+
+    def _buildSceneViewWallNavTiles(self, pageCount):
+        """Prev/page-indicator/Next row below the scene-view content grid - reuses the content
+        grid's own column layout (_gridTileOffsets(3, SCENE_VIEW_WALL_COLUMNS, ...)) so the three
+        nav tiles line up under the three content columns, shifted down by the fixed
+        SCENE_VIEW_WALL_NAV_ROW_DV_M so the row doesn't move between a full page and a short last
+        page. Prev/Next are only pickable (and only get an activation callback) when there's
+        actually a page in that direction; the middle tile is a plain, non-interactive
+        "Page X / Y" indicator."""
+        display = self.getParameterNode().display
+        bgColor = _rgbF(display.wallColor)
+        accentColor = _rgbF(display.accentColor)
+        navOffsets = self._gridTileOffsets(
+            3, SCENE_VIEW_WALL_COLUMNS, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, WALL_TILE_GUTTER_M)
+        currentPage = self._sceneViewWallPage
+        navSpecs = [
+            (currentPage > 0, _("< Prev Page"),
+             (lambda p=currentPage - 1: self._activateSceneViewWallPage(p))),
+            (False, _("Page {current} / {total}").format(current=currentPage + 1, total=pageCount), None),
+            (currentPage < pageCount - 1, _("Next Page >"),
+             (lambda p=currentPage + 1: self._activateSceneViewWallPage(p))),
+        ]
+        actors = []
+        for (enabled, text, callback), (du, _dv) in zip(navSpecs, navOffsets):
+            x, y, z = self._wallTileWorldPosition(
+                "right", SCENE_VIEW_WALL_CENTER_Y_M, SCENE_VIEW_WALL_CENTER_Z_M,
+                du, SCENE_VIEW_WALL_NAV_ROW_DV_M)
+            borderColor = accentColor if enabled else bgColor  # dims a disabled Prev/Next's border
+            texture = self._arrayToTexture(self._signagePanelTexture(bgColor, borderColor))
+            panel = self._wallTilePanelActor(
+                "right", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
+            label = self._wallTileLabelActor("right", y, z, WALL_TILE_HEIGHT_M, text)
+            if enabled and callback is not None:
+                self._wallTileByActor[panel] = _WallTile(
+                    panel, (lambda cb=callback: self._activateWallTile(cb)))
+            else:
+                panel.PickableOff()
+            actors.extend([panel, label])
+        return actors
+
+    def _activateSceneViewWallPage(self, page) -> None:
+        """A Prev/Next nav tile's activation callback - unlike an atlas or scene-view tile, this
+        never touches the MRML scene, so it just jumps straight to rebuilding the wall in place
+        rather than needing an exit/re-enter VR round trip."""
+        self._sceneViewWallPage = page
+        self._rebuildSceneViewWall()
+
+    def _rebuildSceneViewWall(self) -> None:
+        """Tear down and rebuild just the right wall's tiles for the current
+        self._sceneViewWallPage, in place, without touching the atlas wall or the rest of the
+        room. A no-op outside VR (no renderer to rebuild into) - pagination is only reachable via
+        an in-VR tile press in the first place."""
+        renderer = self._vrRenderer()
+        if renderer is None:
+            return
+        self._setHoveredWallTile(None)  # the tile just pressed is about to be torn down
+        for actor in self._sceneViewWallActors:
+            renderer.RemoveViewProp(actor)
+            if actor in self._chromeProps:
+                self._chromeProps.remove(actor)
+            self._wallTileByActor.pop(actor, None)
+        self._sceneViewWallActors = self._buildSceneViewWallTiles()
+        for actor in self._sceneViewWallActors:
+            actor.SetUserMatrix(self._anchorMatrix)
+            renderer.AddViewProp(actor)
+        self._chromeProps.extend(self._sceneViewWallActors)
+        self._rebuildWallTilePicker()
+
+    def _rebuildWallTilePicker(self) -> None:
+        """(Re)build the pick-list-restricted picker from whatever tiles actually got built this
+        session (respecting display.showAtlasWall/showSceneViewWall) - called once per
+        _buildChrome, after the tile actors exist. With no tiles, the pick list stays empty and
+        _onRightAimPose/_onPlaceMeasurementPoint behave exactly as they did before this feature."""
+        picker = vtk.vtkCellPicker()
+        picker.PickFromListOn()
+        for actor in self._wallTileByActor:
+            picker.AddPickList(actor)
+        self._wallTilePicker = picker
+
+    def _setHoveredWallTile(self, tile) -> None:
+        """Cheap hover highlight: swap the panel's own vtkProperty color between white (base) and
+        ACCENT_COLOR (hovered) - the panel's texture is modulated by this property color, so this
+        tints the whole tile without regenerating any texture per-frame."""
+        if tile is self._hoveredWallTile:
+            return
+        if self._hoveredWallTile is not None:
+            self._hoveredWallTile.actor.GetProperty().SetColor(*WALL_TILE_NORMAL_COLOR)
+        if tile is not None:
+            tile.actor.GetProperty().SetColor(*WALL_TILE_HOVER_COLOR)
+        self._hoveredWallTile = tile
+
+    def _pickWallTile(self, pos, ori):
+        """Per-frame aim-ray pick against the tile-only picker - called from _onRightAimPose
+        before the anatomy _measurePicker gets a turn, see the "wall tile galleries" docstring."""
+        renderer = self._vrRenderer()
+        if renderer is None or self._wallTilePicker is None or not self._wallTileByActor:
+            self._setHoveredWallTile(None)
+            return None
+        hit = self._wallTilePicker.Pick3DRay(pos, ori, renderer)
+        tile = self._wallTileByActor.get(self._wallTilePicker.GetActor()) if hit else None
+        self._setHoveredWallTile(tile)
+        return tile
+
+    def _activateWallTile(self, callback) -> None:
+        """Defer the actual activation by one Qt event-loop tick rather than calling `callback`
+        directly from inside this VTK observer callback - _activateAtlasTile below calls
+        exitViewerMode(), which removes the very observer this call originated from
+        (self.removeObservers()); letting the interactor finish dispatching the current event
+        first avoids mutating observer state mid-dispatch."""
+        qt.QTimer.singleShot(0, lambda cb=callback: self._runWallTileActivation(cb))
+
+    @staticmethod
+    def _runWallTileActivation(callback) -> None:
+        try:
+            callback()
+        except Exception:  # noqa: BLE001
+            logging.exception("VR Stage wall tile activation failed")
+
+    def _activateAtlasTile(self, atlasSpec) -> None:
+        """Download (blocking) and load an AtlasTests atlas .mrb, replacing the current scene,
+        while keeping the room/VR experience running across the swap.
+
+        slicer.util.loadScene() defaults to an ADDITIVE import (vtkMRMLScene::Import(), merging
+        the atlas's nodes into whatever is already loaded) unless explicitly told to clear first -
+        properties={"clear": True} routes it through vtkMRMLScene::Connect() instead, which calls
+        Clear(0) before importing, so this really replaces the scene instead of piling atlases on
+        top of each other. Clear(0) is what fires StartCloseEvent/EndCloseEvent;
+        VRStageWidget.onSceneStartClose observes that and calls self.logic.exitViewerMode() on
+        this SAME logic instance, reentrantly, from inside loadScene() itself. Rather than relying
+        on that implicit side effect - which would leave VR fully "active" (input timer running,
+        chrome anchored, observers live) for the entire, possibly multi-second, BLOCKING download
+        that happens BEFORE loadScene() is even called - exit explicitly and first. That makes the
+        later implicit reentrant call a documented no-op (exitViewerMode's existing early-return
+        guard already makes it idempotent), and gives the download itself a clean, fully
+        torn-down window."""
+        wasActive = self.isActive
+        if wasActive:
+            self.exitViewerMode()
+        try:
+            import SampleData
+            filenames = SampleData.downloadFromURL(
+                fileNames=atlasSpec["fileNames"], uris=atlasSpec["uris"],
+                checksums=atlasSpec["checksums"], loadFiles=False)
+            slicer.util.loadScene(filenames[0], properties={"clear": True})
+        except Exception:  # noqa: BLE001
+            logging.exception("Failed to load atlas %s", atlasSpec.get("name"))
+            slicer.util.errorDisplay(
+                _("Failed to load {name}. Check your network connection and try again.")
+                .format(name=atlasSpec["name"]))
+        finally:
+            if wasActive:
+                try:
+                    self.enterViewerMode()
+                except Exception:  # noqa: BLE001
+                    logging.exception("Failed to re-enter VR Stage after atlas activation")
+
+    def _activateSceneViewTile(self, index) -> None:
+        self._restoreSceneViewAtIndex(index)
 
     # ------------------------------------------------------------------ lighting
 
@@ -1548,8 +2079,10 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         return img
 
     @staticmethod
-    def _textActor(position, heightMeters, color=(0.9, 0.95, 1.0)):
-        """A vtkTextActor3D authored in physical meters, facing +Z (toward the user)."""
+    def _textActor(position, heightMeters, color=(0.9, 0.95, 1.0), orientationDeg=(0.0, 0.0, 0.0)):
+        """A vtkTextActor3D authored in physical meters, facing +Z (toward the user) by default -
+        pass orientationDeg to reorient it (e.g. the side-wall tile labels, which need to face
+        into the room instead - see _wallTileLabelActor)."""
         actor = vtk.vtkTextActor3D()
         actor.SetInput(" ")
         tprop = actor.GetTextProperty()
@@ -1560,6 +2093,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         scale = heightMeters / 48.0
         actor.SetScale(scale, scale, scale)
         actor.SetPosition(position[0], position[1], position[2])
+        actor.SetOrientation(*orientationDeg)
         actor.PickableOff()
         return actor
 
@@ -1836,6 +2370,25 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         vtk.vtkMatrix4x4.Multiply4x4(wInverse, baseMatrix, result)
         return result
 
+    @staticmethod
+    def computeDefaultTableHeightM(baseMatrix, relScale, dataBounds):
+        """Tabletop height (meters) that places the data's vertical center at
+        TABLE_COMFORT_CENTER_HEIGHT_M physical, clamped to [TABLE_HEIGHT_MIN_M,
+        TABLE_HEIGHT_MAX_M]. Inverts computePhysicalToWorld's placement: the data center's
+        apparent physical Y = tableHeight + TABLE_TOP_THICKNESS_M + (halfHeight + liftBuffer)/s0,
+        where s0 = _linearScale(baseMatrix) (world units per physical meter)."""
+        if dataBounds[0] > dataBounds[1]:
+            return TABLE_HEIGHT_M
+        s0 = VRStageLogic._linearScale(baseMatrix)
+        if s0 < 1e-9:
+            return TABLE_HEIGHT_M
+        up = VRStageLogic._worldUp(baseMatrix)
+        halfHeightWorld = 0.5 * VRStageLogic._extentAlongAxis(dataBounds, up) * relScale
+        liftWorld = TABLE_LIFT_BUFFER_MM * relScale
+        centerAboveTopM = (halfHeightWorld + liftWorld) / s0
+        height = TABLE_COMFORT_CENTER_HEIGHT_M - TABLE_TOP_THICKNESS_M - centerAboveTopM
+        return max(TABLE_HEIGHT_MIN_M, min(TABLE_HEIGHT_MAX_M, height))
+
     def _currentPhysicalToWorld(self):
         renderWindow = self._renderWindow()
         if renderWindow is None:
@@ -1861,14 +2414,21 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
             renderer.ResetCameraClippingRange()
 
     def _reanchorChrome(self, matrix=None) -> None:
-        """Keep chrome (UserMatrix == _anchorMatrix) equal to the current VR PhysicalToWorld,
-        so the room stays fixed relative to the user no matter what moved the world - our
-        controls OR the built-in complex (A+X) gesture."""
+        """Keep chrome (UserMatrix == _anchorMatrix / _tableAnchorMatrix) equal to the current
+        VR PhysicalToWorld, so the room stays fixed relative to the user no matter what moved
+        the world - our controls OR the built-in complex (A+X) gesture. Table-attached props
+        use _tableAnchorMatrix which additionally translates by the runtime table-height offset
+        (see moveTableVertical / _tableHeightM)."""
         if matrix is None:
             matrix = self._currentPhysicalToWorld()
         if matrix is None:
             return
         self._anchorMatrix.DeepCopy(matrix)
+        self._tableAnchorMatrix.DeepCopy(matrix)
+        delta = self._tableHeightM - TABLE_HEIGHT_M
+        for row in range(3):
+            self._tableAnchorMatrix.SetElement(row, 3,
+                matrix.GetElement(row, 3) + delta * matrix.GetElement(row, 1))
         for prop in self._chromeProps:
             prop.Modified()
 
@@ -1897,7 +2457,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
             return
         yawRad = self._frontFacingYawRad(self._basePhysicalToWorld)
         matrix = self.computePhysicalToWorld(
-            self._basePhysicalToWorld, self._fitRelScale, yawRad, self._dataBounds, self._dataCenter, TABLE_PHYSICAL)
+            self._basePhysicalToWorld, self._fitRelScale, yawRad, self._dataBounds, self._dataCenter, self._tablePhysical())
         self._setPhysicalToWorld(matrix)
         self._turntableAngleRad = 0.0
         self._updateTableScreenOrientation()
@@ -1905,12 +2465,18 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
 
     def _resetFraming(self) -> None:
         """Recompute the data bounds and reframe (used on enter, reset, and after a scene-view
-        change). Fit-to-table is opt-in; otherwise the framing scale is a constant 1.0."""
+        change). Fit-to-table is opt-in; otherwise the framing scale is the user's defaultScale
+        (1.0 = true life size, by default). Also re-derives the data-aware table height so the
+        data's vertical center lands at TABLE_COMFORT_CENTER_HEIGHT_M physical."""
         self._recomputeDataBounds()
-        if self.getParameterNode().fitToTable:
+        parameterNode = self.getParameterNode()
+        if parameterNode.fitToTable:
             self._fitRelScale = self._computeFitRelScale()
         else:
-            self._fitRelScale = self._framingRelScale(DEFAULT_MAGNIFICATION)  # true life size
+            self._fitRelScale = self._framingRelScale(parameterNode.defaultScale)
+        if self._basePhysicalToWorld is not None:
+            self._tableHeightM = self.computeDefaultTableHeightM(
+                self._basePhysicalToWorld, self._fitRelScale, self._dataBounds)
         self._applyFraming()
 
     def _incrementalWorldTransform(self, worldMatrix) -> None:
@@ -1925,13 +2491,18 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         vtk.vtkMatrix4x4.Multiply4x4(inverse, current, newMatrix)
         self._setPhysicalToWorld(newMatrix)
 
+    def _tablePhysical(self):
+        """Live table-top physical point - TABLE_PHYSICAL with the runtime height substituted."""
+        return (0.0, self._tableHeightM + TABLE_TOP_THICKNESS_M, TABLE_FORWARD_M)
+
     def _tableAxle(self, matrix):
         """(worldUp unit vector, table-center world point) for the given PTW matrix - the
         vertical axle the turntable spins/scales about, fixed at the room's table location.
         `up` is re-derived from `matrix` (see _worldUp) so it stays aligned with the table's
         actual current normal even after the free move/rotate/scale gesture tilts the world."""
         up = self._worldUp(matrix)
-        axle = list(matrix.MultiplyPoint([TABLE_PHYSICAL[0], TABLE_PHYSICAL[1], TABLE_PHYSICAL[2], 1.0]))[:3]
+        p = self._tablePhysical()
+        axle = list(matrix.MultiplyPoint([p[0], p[1], p[2], 1.0]))[:3]
         return up, axle
 
     @staticmethod
@@ -1972,10 +2543,13 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
     @staticmethod
     def _collectVisibleDataNodes():
         """Displayable data nodes the user would consider 'on the table': visible models,
-        segmentations, markups, and volumes shown via volume rendering."""
+        segmentations, markups, fiber bundles (e.g. from TractVR), and volumes shown via volume
+        rendering. vtkMRMLFiberBundleNode is a vtkMRMLModelNode subclass, so it's already
+        returned by that class's query below via GetNodesByClass's IsA-based matching - listed
+        explicitly anyway so this stays correct even if that inheritance ever changes."""
         nodes = []
         scene = slicer.mrmlScene
-        for className in ("vtkMRMLModelNode", "vtkMRMLSegmentationNode", "vtkMRMLMarkupsNode"):
+        for className in ("vtkMRMLModelNode", "vtkMRMLSegmentationNode", "vtkMRMLMarkupsNode", "vtkMRMLFiberBundleNode"):
             collection = scene.GetNodesByClass(className)
             collection.UnRegister(None)
             for i in range(collection.GetNumberOfItems()):
@@ -2025,22 +2599,121 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         return [(b[0] + b[1]) / 2.0, (b[2] + b[3]) / 2.0, (b[4] + b[5]) / 2.0]
 
     # ------------------------------------------------------------------ turntable rotation
+    #
+    # Three rotation axes: yaw (left stick left/right, the original "turntable"), pitch (left
+    # stick up/down), and roll (left stick left/right while the left grip - also the
+    # reformat-plane grab handle, see _onGripClick - is held, which borrows that axis from yaw
+    # for as long as it's held). Pitch and roll rotate about axes derived from the user's
+    # current camera orientation (_cameraForwardHorizontal/_cameraRightHorizontal) rather than a
+    # fixed room axis, so "stick forward tilts the top away from you" and "roll spins about the
+    # way you're currently facing" hold true no matter which way the user has already turned the
+    # data or walked around the table - mirrors TractVR's left-stick-driven rotation, which this
+    # was ported from.
+    #
+    # Yaw pivots at the table axle (see _tableAxle, a fixed point at the physical table
+    # SURFACE); pitch/roll pivot at the data's own center (self._dataCenter) instead. Framing
+    # floats the data above the table surface by roughly half its height plus a clearance buffer
+    # (see computePhysicalToWorld), so the axle sits well below the data's true center for
+    # anything but paper-thin data. That offset is invisible for yaw - rotating about a vertical
+    # axis doesn't care how far below the axis the pivot sits - but pitch/roll rotate about
+    # *horizontal* axes, where the same offset turns a should-be in-place spin into a wide
+    # swinging arc. self._dataCenter is already expressed in world/RAS space and constant
+    # regardless of the live PhysicalToWorld matrix (the data's actual position in the scene
+    # never changes - only the physical<->world mapping does), so no transform is needed.
+
+    def _rotateAboutPivot(self, axis, deltaRad, pivot) -> None:
+        """Shared rotation math for all three axes - `axis` and `pivot` are the only things
+        that differ between yaw/pitch/roll (see rotateTurntable/pitchTable/rollTable)."""
+        current = self._currentPhysicalToWorld()
+        if current is None:
+            return
+        t = vtk.vtkTransform()
+        t.PostMultiply()
+        t.Translate(-pivot[0], -pivot[1], -pivot[2])
+        t.RotateWXYZ(vtk.vtkMath.DegreesFromRadians(deltaRad), axis[0], axis[1], axis[2])
+        t.Translate(pivot[0], pivot[1], pivot[2])
+        w = vtk.vtkMatrix4x4()
+        t.GetMatrix(w)
+        self._incrementalWorldTransform(w)
+
+    def _cameraForwardHorizontal(self, matrix):
+        """World-space direction the user is currently looking (from the VR view's active
+        camera, which tracks the HMD), projected onto the plane perpendicular to the table's up
+        axis (see _worldUp) - the roll axis. None if the VR renderer/camera isn't available."""
+        renderer = self._vrRenderer()
+        camera = renderer.GetActiveCamera() if renderer is not None else None
+        if camera is None:
+            return None
+        position, focalPoint = camera.GetPosition(), camera.GetFocalPoint()
+        forward = [focalPoint[i] - position[i] for i in range(3)]
+        up = self._worldUp(matrix)
+        d = vtk.vtkMath.Dot(forward, up)
+        horizontal = [forward[i] - d * up[i] for i in range(3)]
+        norm = vtk.vtkMath.Norm(horizontal)
+        return [c / norm for c in horizontal] if norm > 1e-6 else None
+
+    def _cameraRightHorizontal(self, matrix):
+        """Horizontal axis to the user's current right (forward x up) - the pitch axis."""
+        forward = self._cameraForwardHorizontal(matrix)
+        if forward is None:
+            return None
+        up = self._worldUp(matrix)
+        right = [0.0, 0.0, 0.0]
+        vtk.vtkMath.Cross(forward, up, right)
+        norm = vtk.vtkMath.Norm(right)
+        return [c / norm for c in right] if norm > 1e-6 else None
 
     def rotateTurntable(self, deltaRad) -> None:
+        """Yaw: left stick left/right (the original, always-available turntable control)."""
         current = self._currentPhysicalToWorld()
         if current is None:
             return
         up, axle = self._tableAxle(current)
+        self._rotateAboutPivot(up, deltaRad, axle)
+        self._turntableAngleRad += deltaRad
+        self._updateTableScreenOrientation()
+
+    def pitchTable(self, deltaRad) -> None:
+        """Pitch: left stick up/down. Pivots at the data center, not the table axle - see the
+        "turntable rotation" section docstring above for why."""
+        current = self._currentPhysicalToWorld()
+        if current is None:
+            return
+        right = self._cameraRightHorizontal(current)
+        if right is not None:
+            self._rotateAboutPivot(right, deltaRad, self._dataCenter)
+
+    def rollTable(self, deltaRad) -> None:
+        """Roll: left stick left/right while the left grip roll modifier is held. Pivots at the
+        data center, not the table axle - see the "turntable rotation" section docstring above
+        for why."""
+        current = self._currentPhysicalToWorld()
+        if current is None:
+            return
+        forward = self._cameraForwardHorizontal(current)
+        if forward is not None:
+            self._rotateAboutPivot(forward, deltaRad, self._dataCenter)
+
+    def moveTableVertical(self, deltaM) -> None:
+        """Left stick up/down while the left grip is held: raise/lower the pedestal table (and
+        the data on it) by deltaM physical meters, clamped to [TABLE_HEIGHT_MIN_M,
+        TABLE_HEIGHT_MAX_M]. The chrome offset and the data translation are applied together
+        in one _incrementalWorldTransform call, so table and data never desync."""
+        current = self._currentPhysicalToWorld()
+        if current is None:
+            return
+        newHeight = max(TABLE_HEIGHT_MIN_M, min(TABLE_HEIGHT_MAX_M, self._tableHeightM + deltaM))
+        actualDelta = newHeight - self._tableHeightM
+        if abs(actualDelta) < 1e-9:
+            return
+        self._tableHeightM = newHeight
+        up = self._worldUp(current)
+        worldDelta = actualDelta * self._linearScale(current)
         t = vtk.vtkTransform()
-        t.PostMultiply()
-        t.Translate(-axle[0], -axle[1], -axle[2])
-        t.RotateWXYZ(vtk.vtkMath.DegreesFromRadians(deltaRad), up[0], up[1], up[2])
-        t.Translate(axle[0], axle[1], axle[2])
+        t.Translate(up[0] * worldDelta, up[1] * worldDelta, up[2] * worldDelta)
         w = vtk.vtkMatrix4x4()
         t.GetMatrix(w)
         self._incrementalWorldTransform(w)
-        self._turntableAngleRad += deltaRad
-        self._updateTableScreenOrientation()
 
     def toggleAutoSpin(self) -> None:
         """Left menu button: hands-free presentation rotation (paused while the user drives
@@ -2050,10 +2723,31 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
     def _onInputTimer(self) -> None:
         dt = INPUT_TIMER_INTERVAL_MS / 1000.0
 
-        # Turntable: left stick drives it; otherwise auto-spin if enabled.
-        if abs(self._leftStickX) >= THUMBSTICK_DEADZONE:
+        # Left stick drives rotation (or table height while the left grip modifier is held);
+        # otherwise auto-spin if enabled. Without the modifier: X yaws, Y pitches. With the left
+        # grip held: X rolls, Y moves the table up/down (see moveTableVertical).
+        # Axis-dominant: a real thumbstick push is rarely perfectly axis-aligned, so without this
+        # a push meant as pure yaw/pitch leaks a small amount onto the other axis every tick and
+        # reads as "rotating the wrong axis." Only the larger-magnitude axis drives this tick;
+        # the smaller one is dropped entirely rather than blended in.
+        x = self._leftStickX if abs(self._leftStickX) >= THUMBSTICK_DEADZONE else 0.0
+        y = self._leftStickY if abs(self._leftStickY) >= THUMBSTICK_DEADZONE else 0.0
+        if abs(x) >= abs(y):
+            y = 0.0
+        else:
+            x = 0.0
+        if x != 0.0 or y != 0.0:
             speedRad = vtk.vtkMath.RadiansFromDegrees(self.getParameterNode().rotationSpeedDegPerSec)
-            self.rotateTurntable(speedRad * self._leftStickX * dt)
+            if self._reformatGripHeldSide == "Left":
+                if x != 0.0:
+                    self.rollTable(speedRad * x * dt)
+                if y != 0.0:
+                    self.pitchTable(speedRad * y * dt)
+            else:
+                if x != 0.0:
+                    self.rotateTurntable(speedRad * x * dt)
+                if y != 0.0:
+                    self.moveTableVertical(TABLE_MOVE_SPEED_M_PER_S * y * dt)
         elif self._autoSpin:
             self.rotateTurntable(vtk.vtkMath.RadiansFromDegrees(AUTO_SPIN_DEG_PER_SEC) * dt)
 
@@ -2105,8 +2799,8 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         self.setMagnification(self.steppedMagnification(self._currentMagnification(), direction, stepFactor))
 
     def resetMagnification(self) -> None:
-        """Left-stick click: recenter the data on the table at scale 1.0, rotation zeroed
-        (also clears any gesture drift)."""
+        """Left-stick click: recenter the data on the table at the default framing scale (or the
+        fit-to-table scale, if enabled), rotation zeroed (also clears any gesture drift)."""
         self._resetFraming()
 
     # ------------------------------------------------------------------ arbitrary reformat slice
@@ -2356,11 +3050,14 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
     #
     # In-VR point-to-point distance measurement, for solo review rather than presentation: aim
     # the right controller (RightAimPoseEvent - the forward-pointing ray, distinct from the grip
-    # pose the reformat plane uses) at the anatomy, press Right A to place a point, press it
-    # again to complete the pair into a real vtkMRMLMarkupsLineNode. Left X undoes the most
-    # recent action. Both buttons are otherwise unbound in this module - see the debounce note on
-    # _isButton1PressSuppressed for why they're safe to reuse even though the built-in
-    # two-controller free-gesture also watches them (held together).
+    # pose the reformat plane uses) at the anatomy, pull the right trigger (placeMeasurementPoint,
+    # default "Right Trigger") to place a point, pull it again to complete the pair into a real
+    # vtkMRMLMarkupsLineNode. The left trigger (undoMeasurement, default "Left Trigger") undoes
+    # the most recent action. If a wall tile is picked instead of anatomy, this same trigger
+    # activates the tile rather than placing a point - see the "wall tile galleries" section and
+    # _onPlaceMeasurementPoint. See the debounce note on _isButton1PressSuppressed for why these
+    # are also safe to rebind onto A/X even though the built-in two-controller free-gesture
+    # watches those (held together).
     #
     # Picking uses vtkCellPicker.Pick3DRay against the VR renderer with its default (unrestricted)
     # settings - every VRStage-owned chrome/label/UI actor already calls PickableOff(), so a
@@ -2500,6 +3197,22 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
 
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onRightAimPose(self, caller, event, calldata):
+        # Wall tiles are picked FIRST, against their own dedicated, pick-list-restricted picker
+        # (see the "wall tile galleries" section) - only when the aim ray misses every tile does
+        # the anatomy _measurePicker (unrestricted) get a turn. This makes "hovering a tile" and
+        # "aiming at anatomy" mutually exclusive by construction, so _onPlaceMeasurementPoint
+        # below never has to guess which one the user meant.
+        try:
+            pos, ori = calldata.GetWorldPosition(), calldata.GetWorldOrientation()
+        except Exception:  # noqa: BLE001
+            self._setHoveredWallTile(None)
+            self._updateMeasureReticle(calldata)
+            return
+        if self._pickWallTile(pos, ori) is not None:
+            self._measureCurrentHit = None
+            if self._measureReticleActor is not None:
+                self._measureReticleActor.VisibilityOff()
+            return
         self._updateMeasureReticle(calldata)
 
     @vtk.calldata_type(vtk.VTK_OBJECT)
@@ -2510,6 +3223,9 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         if self._isButton1PressSuppressed(
                 time.time(), self._button1Held["Left"], self._button1PressTime["Left"],
                 MEASURE_GESTURE_SUPPRESS_WINDOW_S):
+            return
+        if self._hoveredWallTile is not None:
+            self._hoveredWallTile.onActivate()
             return
         if self._measureCurrentHit is None:
             self._flashMeasureFeedback()
@@ -2551,8 +3267,17 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         count = logic.GetNumberOfSceneViews()
         if count <= 0:
             return
-        self._sceneViewIndex = (self._sceneViewIndex + (1 if direction > 0 else -1)) % count
-        logic.RestoreSceneView(self._sceneViewIndex)
+        nextIndex = (self._sceneViewIndex + (1 if direction > 0 else -1)) % count
+        self._restoreSceneViewAtIndex(nextIndex)
+
+    def _restoreSceneViewAtIndex(self, index) -> None:
+        """Shared tail for "jump to a specific scene view" - used by cycleSceneView (relative)
+        and _activateSceneViewTile (absolute, from a right-wall tile press)."""
+        logic = self._sceneViewsLogic()
+        if logic is None or not (0 <= index < logic.GetNumberOfSceneViews()):
+            return
+        self._sceneViewIndex = index
+        logic.RestoreSceneView(index)
         self._recomputeDataBounds()
         self._updateSceneViewReadout()
 
@@ -2569,27 +3294,29 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         self._interactor = interactor
         highPriority = 100.0
 
-        def add(eventId, callback):
-            self._observerTags.append(interactor.AddObserver(eventId, callback, highPriority))
-
         # Bind a user-rebindable action (see VRStageControlBindings/CONTROL_BINDING_EVENT_NAMES)
-        # to whatever button is currently configured for it.
+        # to whatever button is currently configured for it - or skip it entirely if it's
+        # deliberately left Unbound (see CONTROL_BINDING_UNBOUND).
         controls = self.getParameterNode().controls
 
         def addAction(fieldName, callback):
             label = getattr(controls, fieldName)
+            if label == CONTROL_BINDING_UNBOUND:
+                return
             eventName = CONTROL_BINDING_EVENT_NAMES[label]
-            add(getattr(style, eventName), callback)
+            self.addObserver(interactor, getattr(style, eventName), callback, priority=highPriority)
 
-        add(style.LeftThumbstickEvent, self._onLeftThumbstick)
+        self.addObserver(interactor, style.LeftThumbstickEvent, self._onLeftThumbstick, priority=highPriority)
         # widget.setDolly3DEnabled(False) (see enterViewerMode) does NOT actually suppress the
         # right thumbstick's default fly/dolly behavior in practice - observe both its position
         # and touch events at high priority and abort them instead, the same way the old
-        # right-stick-scroll code used to (see _abort).
-        self._rightStickPosTag = interactor.AddObserver(style.RightThumbstickEvent, self._onRightThumbstick, highPriority)
-        self._rightStickTouchTag = interactor.AddObserver(style.RightThumbstickTouchEvent, self._onRightThumbstickTouch, highPriority)
-        self._observerTags.append(self._rightStickPosTag)
-        self._observerTags.append(self._rightStickTouchTag)
+        # right-stick-scroll code used to (see _abort). The raw tags are fetched back out of the
+        # mixin (rather than using AddObserver's return value directly) since _abort needs them
+        # to reach into the interactor's vtkCommand.
+        self.addObserver(interactor, style.RightThumbstickEvent, self._onRightThumbstick, priority=highPriority)
+        self.addObserver(interactor, style.RightThumbstickTouchEvent, self._onRightThumbstickTouch, priority=highPriority)
+        _, self._rightStickPosTag, _ = self.getObserver(interactor, style.RightThumbstickEvent, self._onRightThumbstick)
+        _, self._rightStickTouchTag, _ = self.getObserver(interactor, style.RightThumbstickTouchEvent, self._onRightThumbstickTouch)
         addAction("scaleUp", self._onScaleUp)
         addAction("scaleDown", self._onScaleDown)
         addAction("nextSceneView", self._onNextSceneView)
@@ -2600,16 +3327,15 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         # Click starts/stops tracking that hand (see _onGripClick); the continuous pose events
         # (fired every frame regardless of button state) do the actual following while held.
         # "Either grip" is a fixed structural affordance, not one of the rebindable actions above.
-        add(style.LeftGripClickEvent, self._onLeftGripClick)
-        add(style.RightGripClickEvent, self._onRightGripClick)
-        add(style.LeftGripPoseEvent, self._onLeftGripPose)
-        add(style.RightGripPoseEvent, self._onRightGripPose)
+        self.addObserver(interactor, style.LeftGripClickEvent, self._onLeftGripClick, priority=highPriority)
+        self.addObserver(interactor, style.RightGripClickEvent, self._onRightGripClick, priority=highPriority)
+        self.addObserver(interactor, style.LeftGripPoseEvent, self._onLeftGripPose, priority=highPriority)
+        self.addObserver(interactor, style.RightGripPoseEvent, self._onRightGripPose, priority=highPriority)
         # Measurement tool: aim ray (right hand only, v1, fixed - not rebindable) + place/undo
-        # buttons (rebindable, default A/X - see the "measurement tool" section for the debounce
-        # that keeps the *defaults* safe to reuse alongside the built-in two-controller
-        # free-gesture; rebinding these away from A/X loosens that debounce's original intent,
-        # see VRStageControlBindings' docstring).
-        add(style.RightAimPoseEvent, self._onRightAimPose)
+        # buttons (rebindable, default the triggers - see the "measurement tool" section for the
+        # debounce that keeps A/X safe to rebind these onto alongside the built-in two-controller
+        # free-gesture; see VRStageControlBindings' docstring).
+        self.addObserver(interactor, style.RightAimPoseEvent, self._onRightAimPose, priority=highPriority)
         addAction("placeMeasurementPoint", self._onPlaceMeasurementPoint)
         addAction("undoMeasurement", self._onUndoMeasurement)
 
@@ -2618,10 +3344,9 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         self._physicalToWorldConnected = True
 
     def _removeObservers(self) -> None:
-        if self._interactor is not None:
-            for tag in self._observerTags:
-                self._interactor.RemoveObserver(tag)
-        self._observerTags = []
+        self.removeObservers()
+        self._rightStickPosTag = None
+        self._rightStickTouchTag = None
         self._interactor = None
 
         widget = self._vrViewWidget()
@@ -2644,8 +3369,10 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
         try:
             pos = calldata.GetTrackPadPosition()
             self._leftStickX = float(pos[0])
+            self._leftStickY = float(pos[1])
         except Exception:  # noqa: BLE001
             self._leftStickX = 0.0
+            self._leftStickY = 0.0
 
     def _abort(self, tag):
         """Stop the default (lower-priority) processing of an event we've taken over."""
@@ -2657,8 +3384,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic):
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _onRightThumbstick(self, caller, event, calldata):
         # Right stick isn't used for anything of ours - this observer exists purely to abort the
-        # default fly/dolly translation (see _installObservers for why setDolly3DEnabled(False)
-        # alone isn't sufficient).
+        # default fly/dolly translation
         self._abort(self._rightStickPosTag)
 
     @vtk.calldata_type(vtk.VTK_OBJECT)
@@ -2735,5 +3461,20 @@ class VRStageTest(ScriptedLoadableModuleTest):
         expected = [dataCenter[a] - up[a] * TABLE_LIFT_BUFFER_MM for a in range(3)]
         for a in range(3):
             self.assertAlmostEqual(mapped[a], expected[a], places=4)
+
+        # Data-aware table height: mid-range data (200mm along up) at mag 1 puts the center at
+        # TABLE_COMFORT_CENTER_HEIGHT_M physical (= tabletop 0.94 m); tall data clamps to MIN.
+        s0 = UNIT_MAGNIFICATION_SCALE
+        baseM = vtk.vtkMatrix4x4()
+        for i in range(3):
+            baseM.SetElement(i, i, s0)
+        midBounds = [-100.0, 100.0, -100.0, 100.0, -100.0, 100.0]
+        self.assertAlmostEqual(
+            VRStageLogic.computeDefaultTableHeightM(baseM, 1.0, midBounds), 0.59, places=6)
+        tallBounds = [-900.0, 900.0, -900.0, 900.0, -900.0, 900.0]
+        self.assertEqual(
+            VRStageLogic.computeDefaultTableHeightM(baseM, 1.0, tallBounds), TABLE_HEIGHT_MIN_M)
+        self.assertEqual(
+            VRStageLogic.computeDefaultTableHeightM(baseM, 1.0, emptyBounds), TABLE_HEIGHT_M)
 
         self.delayDisplay("Test passed")
