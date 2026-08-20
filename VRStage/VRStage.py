@@ -340,7 +340,7 @@ HELP_TITLE_BODY_GAP_M = 0.05      # deliberate breathing room between title and 
 HELP_PANEL_TEXT_MARGIN_M = 0.05   # from the usable (border-excluded) interior edge to the text
 HELP_PANEL_BORDER_FRAC = 0.05     # must match _signagePanelTexture's default borderFrac
 
-# HELP_PANEL_HEIGHT_M is derived, not hand-tuned: vtkTextActor3D's rendered height for N lines at
+# HELP_PANEL_HEIGHT_M is derived, not hand-tuned: the text renderer's rendered height for N lines at
 # heightMeters is always <= N * heightMeters (measured ~0.955x), so budgeting with the nominal
 # heightMeters values here is already conservative. Deriving the panel height from that budget -
 # instead of picking one by eye - keeps title+body guaranteed to fit inside the border (previously
@@ -399,7 +399,10 @@ MONITOR_HINGE_ROTATION_DEG = 90.0 - MONITOR_TILT_FROM_HORIZONTAL_DEG
 # R/L/A/P/S/I orientation labels are authored directly in RAS/world (not anchored to physical
 # space like the rest of the chrome - see _updateOrientationLabels), so they turn with the
 # anatomy as the turntable spins and always show which anatomical direction currently faces the
-# user. vtkBillboardTextActor3D keeps a constant on-screen size and always faces the camera.
+# user. Each is a camera-facing cut-out letter (vtkFollower carrying baked text - see
+# _BakedTextMixin) sized relative to the data, rather than a vtkBillboardTextActor3D: billboards
+# are translucent quads, and translucent props in the VR view are very expensive (see the
+# "baked text" section below).
 ORIENTATION_LABEL_AXES = {
     "R": (1.0, 0.0, 0.0),
     "L": (-1.0, 0.0, 0.0),
@@ -410,7 +413,24 @@ ORIENTATION_LABEL_AXES = {
 }
 ORIENTATION_LABEL_MARGIN_MM = 40.0
 ORIENTATION_LABEL_DEFAULT_RADIUS_MM = 150.0
-ORIENTATION_LABEL_FONT_SIZE = 22
+ORIENTATION_LABEL_FONT_SIZE = 96   # raster resolution only - world size is set from the data
+                                   # (see _updateOrientationLabels); high so the cut-out edges
+                                   # stay smooth when the letters are viewed up close
+ORIENTATION_LABEL_HEIGHT_M = 0.035  # letter height in PHYSICAL meters - held constant across
+                                    # magnification (see _updateOrientationLabelScale), the way
+                                    # the old constant-screen-size billboards read
+
+# Baked text: every piece of text in the room (signage, info screen, tile labels, orientation
+# badges) is rendered ONCE by vtkTextRenderer into an opaque RGB texture on a plain quad, instead
+# of using vtkTextActor3D / vtkBillboardTextActor3D. Those two are translucent props, and
+# profiling in-headset (2064x2272 per eye, depth peeling on, which transparent data needs) showed
+# each one costing ~1-2 ms PER FRAME just by existing - 14 of them were ~24 ms of a ~40 ms frame -
+# whereas an opaque textured quad costs ~0.04 ms. Opaque means the text is composited over the
+# colour of whatever panel it sits on (bgColor), so each quad reads as part of that panel.
+BAKED_TEXT_DPI = 72        # vtkTextActor3D's default rendered DPI - keeps the font metrics (and
+                           # therefore every layout constant above) identical to before
+BAKED_TEXT_FONT_PX = 48    # authored font size; a quad is authored in pixels, then scaled so
+                           # BAKED_TEXT_FONT_PX pixels == the requested height in meters
 
 # Extra clearance between the anatomy's bottom and the table surface (see computePhysicalToWorld),
 # so the data floats just above the table instead of sitting flush against it. Kept comfortably
@@ -552,10 +572,12 @@ _WallTile = collections.namedtuple("_WallTile", ["actor", "onActivate"])
 # long as its grip is held (_trackReformatPlaneToController), driving a dedicated, non-layout
 # slice node's SliceToRAS. The reformatted image is shown on a floating screen that rides
 # alongside the plane (see _updateReformatFromPlane), rather than coincident with it, so the
-# translucent handle and the crisp image never occupy the same surface.
+# handle and the crisp image never occupy the same surface. The handle is an opaque square FRAME
+# (not a translucent filled plane, which - like any translucent prop - costs milliseconds per
+# frame under depth peeling) so the anatomy it cuts through stays visible inside it.
 REFORMAT_SLICE_LAYOUT_NAME = "VRReformat"
 REFORMAT_PLANE_NODE_NAME = "VR Reformat Plane"
-REFORMAT_HANDLE_OPACITY = 0.15
+REFORMAT_HANDLE_FRAME_FRAC = 0.03  # frame bar width, as a fraction of the handle's side length
 REFORMAT_HANDLE_SIZE_FRAC = 0.6   # handle side length, as a fraction of the background volume's
                                    # RAS bounding-box diagonal
 DEFAULT_REFORMAT_HANDLE_SIZE_MM = 150.0  # fallback if no volume is loaded yet
@@ -689,6 +711,119 @@ class VRStageParameterNode:
     overheadLight: bool = True
     display: VRStageDisplayOptions = VRStageDisplayOptions()
     controls: VRStageControlBindings = VRStageControlBindings()
+
+
+class _BakedTextMixin:
+    """Shared implementation for the two baked-text props below (see BAKED_TEXT_DPI for why
+    text is baked at all). The text is rasterized by vtkTextRenderer - the same engine behind
+    vtkTextActor3D, so metrics match - over an OPAQUE background (bgColor), its alpha channel is
+    dropped (vtkImageExtractComponents -> 3-component RGB, which vtkTexture::IsTranslucent
+    treats as opaque without even scanning pixels), and the result is mapped onto a quad whose
+    corners are the rasterized image's extent in PIXELS. vtkTextRenderer already offsets that
+    extent by the text property's justification (centered -> x in [-w/2, w/2], bottom -> y in
+    [0, h]), so the prop's origin sits exactly where vtkTextActor3D's did; callers scale the
+    prop to turn pixels into meters/mm. Only SetInput/Rebake rasterize - never rendering."""
+
+    def initText(self, fontSizePx, color, bgColor=None) -> None:
+        """bgColor: the panel colour to composite over (opaque RGB texture). None: a "cut-out"
+        label instead - no background at all, the RGBA texture is kept but the prop is forced
+        into the OPAQUE pass and a fragment-shader replacement discards pixels under 50% alpha.
+        Still no translucent geometry (so no depth-peeling cost), at the price of hard-edged
+        glyphs - fine for big bold letters floating in space (the orientation labels)."""
+        self._text = None
+        self._cutout = bgColor is None
+        self._tprop = vtk.vtkTextProperty()
+        self._tprop.SetFontSize(fontSizePx)
+        self._tprop.SetColor(*color)
+        if not self._cutout:
+            self._tprop.SetBackgroundColor(*bgColor)
+            self._tprop.SetBackgroundOpacity(1.0)
+        self._image = vtk.vtkImageData()
+        # vtkTextRenderer allocates a power-of-two image and draws the text into just its
+        # bounding box (the rest stays black/transparent) - vtkTextActor3D hides that padding
+        # with a display extent; here the image is clipped to the bbox instead (see Rebake).
+        self._clip = vtk.vtkImageClip()
+        self._clip.SetInputData(self._image)
+        self._clip.ClipDataOn()
+        texture = vtk.vtkTexture()
+        if self._cutout:
+            # A transparent margin around the glyphs (the rasterized image has none below/left
+            # of the bbox) so the alpha test never lands on the quad's clamped edge texels -
+            # that showed as a ragged line along the bottom where the shadow ends.
+            self._pad = vtk.vtkImageConstantPad()
+            self._pad.SetInputConnection(self._clip.GetOutputPort())
+            self._pad.SetConstant(0.0)
+            texture.SetInputConnection(self._pad.GetOutputPort())
+        else:
+            self._rgb = vtk.vtkImageExtractComponents()
+            self._rgb.SetInputConnection(self._clip.GetOutputPort())
+            self._rgb.SetComponents(0, 1, 2)
+            texture.SetInputConnection(self._rgb.GetOutputPort())
+        texture.InterpolateOn()
+        # Mipmaps smear alpha across levels, which the cut-out alpha test then turns into
+        # crawling edges; the cut-out glyphs are baked large instead (ORIENTATION_LABEL_FONT_SIZE).
+        texture.SetMipmap(not self._cutout)
+        texture.EdgeClampOn()
+        self._plane = vtk.vtkPlaneSource()
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(self._plane.GetOutputPort())
+        if self._cutout:
+            # Runs after the texture has been multiplied into gl_FragData[0] (TCoord::Impl),
+            # so its alpha is the glyph coverage: drop everything that isn't glyph/shadow.
+            self.GetShaderProperty().AddFragmentShaderReplacement(
+                "//VTK::Picking::Impl", True,
+                "  if (gl_FragData[0].a < 0.5) { discard; }\n//VTK::Picking::Impl\n", False)
+            self.ForceOpaqueOn()
+        self.SetMapper(mapper)
+        self.SetTexture(texture)
+        self.GetProperty().SetColor(1.0, 1.0, 1.0)  # texture carries the colours
+        self.PickableOff()
+
+    def GetTextProperty(self):
+        """Edits to the returned property only take effect after Rebake()."""
+        return self._tprop
+
+    def GetInput(self):
+        return self._text
+
+    def SetInput(self, text) -> None:
+        if text == self._text:
+            return
+        self._text = text
+        self.Rebake()
+
+    def MeasureWidthPx(self, text) -> int:
+        """Rendered width of text in pixels (same units as the quad), without rasterizing."""
+        bbox = [0, 0, 0, 0]
+        vtk.vtkTextRenderer.GetInstance().GetBoundingBox(self._tprop, text, bbox, BAKED_TEXT_DPI)
+        return bbox[1] - bbox[0] + 1
+
+    def Rebake(self) -> None:
+        text = self._text if self._text else " "
+        if not vtk.vtkTextRenderer.GetInstance().RenderString(
+                self._tprop, text, self._image, [0, 0], BAKED_TEXT_DPI):
+            logging.warning("VRStage: failed to rasterize text %r", text)
+            return
+        bbox = [0, 0, 0, 0]
+        vtk.vtkTextRenderer.GetInstance().GetBoundingBox(self._tprop, text, bbox, BAKED_TEXT_DPI)
+        x0, x1, y0, y1 = bbox
+        self._clip.SetOutputWholeExtent(x0, x1, y0, y1, 0, 0)
+        if self._cutout:
+            pad = 4
+            x0, x1, y0, y1 = x0 - pad, x1 + pad, y0 - pad, y1 + pad
+            self._pad.SetOutputWholeExtent(x0, x1, y0, y1, 0, 0)
+        self._plane.SetOrigin(x0, y0, 0.0)
+        self._plane.SetPoint1(x1 + 1, y0, 0.0)
+        self._plane.SetPoint2(x0, y1 + 1, 0.0)
+        self._image.Modified()
+
+
+class _BakedTextActor(_BakedTextMixin, vtk.vtkActor):
+    """Baked text on a fixed-orientation quad - signage, info screen, tile labels."""
+
+
+class _BakedFollowerTextActor(_BakedTextMixin, vtk.vtkFollower):
+    """Baked text on a camera-facing quad - the orientation badges."""
 
 
 class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
@@ -994,6 +1129,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             accentColor = _rgbF(display.accentColor)
             for actor in self._orientationLabelActors.values():
                 actor.GetTextProperty().SetColor(*accentColor)
+                actor.Rebake()
 
     # ------------------------------------------------------------------ chrome
 
@@ -1023,7 +1159,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         floorRing = self._glowRingActor(
             center=(tableCenterXZ[0], FLOOR_THICKNESS_M + 0.002, tableCenterXZ[1]),
             innerRadius=FLOOR_RING_INNER_M, outerRadius=FLOOR_RING_OUTER_M,
-            color=accentColor, opacity=0.85)
+            color=accentColor)
 
         column = self._discActor(
             center=(0.0, TABLE_HEIGHT_M - TABLE_HEIGHT_MAX_M / 2.0, TABLE_FORWARD_M),
@@ -1031,7 +1167,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         columnBand = self._glowRingActor(
             center=(tableCenterXZ[0], TABLE_HEIGHT_M - RIM_BAND_HEIGHT_M - 0.10, tableCenterXZ[1]),
             innerRadius=0.0, outerRadius=COLUMN_RADIUS_M * 1.02,
-            color=accentColorDim, opacity=0.9)
+            color=accentColorDim)
 
         # Raised collar/apron band circling the table, sitting directly under the cap (in the
         # space otherwise occupied only by the thin column) - gives the table a real pedestal
@@ -1098,7 +1234,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             center=(tableCenterXZ[0], tableTopY + 0.003, tableCenterXZ[1]),
             innerRadius=RIM_BAND_RADIUS_M * COLLAR_SEAM_RING_INNER_FRAC,
             outerRadius=RIM_BAND_RADIUS_M * COLLAR_SEAM_RING_OUTER_FRAC,
-            color=accentColorDim, opacity=0.75)
+            color=accentColorDim)
 
         tableProps = [
             column, columnBand, collar,
@@ -1210,7 +1346,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         panelProp.SetDiffuse(0.1)
         panel.PickableOff()
 
-        # Both anchored bottom-up (vtkTextActor3D's VerticalJustificationToBottom): title sits
+        # Both anchored bottom-up (the text's VerticalJustificationToBottom): title sits
         # just inside the top border, body's bottom is placed so title-bottom .. body-top leaves
         # exactly HELP_TITLE_BODY_GAP_M, and body-bottom lands (by construction of
         # HELP_PANEL_HEIGHT_M above) just inside the bottom border.
@@ -1221,12 +1357,12 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         textZ = BACK_WALL_Z_M + BACK_WALL_TEXT_OFFSET_M
         title = VRStageLogic._textActor(
             position=(0.0, titleBottomY, textZ),
-            heightMeters=HELP_TITLE_HEIGHT_M, color=accentColor)
+            heightMeters=HELP_TITLE_HEIGHT_M, color=accentColor, bgColor=bgColor)
         title.SetInput(_("VR VIEWER CONTROLS"))
 
         body = VRStageLogic._textActor(
             position=(0.0, bodyBottomY, textZ),
-            heightMeters=HELP_BODY_HEIGHT_M, color=(0.75, 0.90, 0.95))
+            heightMeters=HELP_BODY_HEIGHT_M, color=(0.75, 0.90, 0.95), bgColor=bgColor)
         body.SetInput(VRStageLogic._controlSchemeBodyText(controls))
 
         return [panel, title, body]
@@ -1298,13 +1434,16 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         viewBottomY = scaleBottomY - INFO_SCREEN_LINE_GAP_M - INFO_SCREEN_NAME_LINE_HEIGHT_M
         textZ = screenZ + MONITOR_TEXT_PROUD_M  # proud of the screen face
 
+        screenBgColor = _rgbF(display.tableScreenBackgroundColor)
         self._scaleTextActor = self._textActor(
             position=(hingeX, scaleBottomY, textZ),
-            heightMeters=INFO_SCREEN_LINE_HEIGHT_M, color=_rgbF(display.accentColor))
+            heightMeters=INFO_SCREEN_LINE_HEIGHT_M, color=_rgbF(display.accentColor),
+            bgColor=screenBgColor)
 
         self._sceneViewTextActor = self._textActor(
             position=(hingeX, viewBottomY, textZ),
-            heightMeters=INFO_SCREEN_NAME_LINE_HEIGHT_M, color=(0.75, 0.90, 0.95))
+            heightMeters=INFO_SCREEN_NAME_LINE_HEIGHT_M, color=(0.75, 0.90, 0.95),
+            bgColor=screenBgColor)
 
         # Group as one rigid body and pivot about the hinge - see vtkProp3D's Origin/Orientation/
         # Position composition (Translate(Origin+Position) . Rotate . Scale . Translate(-Origin)):
@@ -1425,11 +1564,12 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         return actor
 
     @staticmethod
-    def _wallTileLabelActor(side, y, z, height, text, color=(0.9, 0.95, 1.0)):
+    def _wallTileLabelActor(side, y, z, height, text, bgColor, color=(0.9, 0.95, 1.0)):
         """The tile's name label, held WALL_TILE_TEXT_PROUD_M proud of the wall (a bit further
         than the panel's WALL_TILE_PANEL_PROUD_M, avoiding z-fighting - same reasoning as
         BACK_WALL_TEXT_OFFSET_M vs. BACK_WALL_PANEL_OFFSET_M) and rotated to face into the room -
-        vtkTextActor3D faces +Z by default, side-wall tiles need it facing +/-X instead."""
+        a text quad faces +Z by default, side-wall tiles need it facing +/-X instead. bgColor is
+        the wall colour the label strip is baked over (see _BakedTextMixin)."""
         if side == "left":
             labelX = -ROOM_SIZE_M[0] / 2.0 + WALL_TILE_TEXT_PROUD_M
             orientationDeg = (0.0, 90.0, 0.0)
@@ -1438,7 +1578,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             orientationDeg = (0.0, -90.0, 0.0)
         actor = VRStageLogic._textActor(
             (labelX, y - height / 2.0 + WALL_TILE_LABEL_MARGIN_M, z),
-            WALL_TILE_LABEL_HEIGHT_M, color=color, orientationDeg=orientationDeg)
+            WALL_TILE_LABEL_HEIGHT_M, color=color, orientationDeg=orientationDeg, bgColor=bgColor)
         actor.SetInput(text)
         return actor
 
@@ -1474,7 +1614,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             texture = self._arrayToTexture(self._atlasTileTexture(atlasSpec["kind"], bgColor, borderColor))
             panel = self._wallTilePanelActor(
                 "left", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
-            label = self._wallTileLabelActor("left", y, z, WALL_TILE_HEIGHT_M, atlasSpec["name"])
+            label = self._wallTileLabelActor("left", y, z, WALL_TILE_HEIGHT_M, atlasSpec["name"], bgColor)
             self._wallTileByActor[panel] = _WallTile(
                 panel, (lambda spec=atlasSpec: self._activateWallTile(
                     lambda s=spec: self._activateAtlasTile(s))))
@@ -1503,7 +1643,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
                 "right", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
             panel.PickableOff()  # placeholder only - not a real, activatable tile
             label = self._wallTileLabelActor(
-                "right", y, z, WALL_TILE_HEIGHT_M, _("No scene views saved"))
+                "right", y, z, WALL_TILE_HEIGHT_M, _("No scene views saved"), bgColor)
             return [panel, label]
 
         pageCount = math.ceil(totalCount / SCENE_VIEW_WALL_PAGE_SIZE)
@@ -1530,7 +1670,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             panel = self._wallTilePanelActor(
                 "right", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
             name = logic.GetNthSceneViewName(index) or _("(unnamed)")
-            label = self._wallTileLabelActor("right", y, z, WALL_TILE_HEIGHT_M, name)
+            label = self._wallTileLabelActor("right", y, z, WALL_TILE_HEIGHT_M, name, bgColor)
             self._wallTileByActor[panel] = _WallTile(
                 panel, (lambda i=index: self._activateWallTile(
                     lambda idx=i: self._activateSceneViewTile(idx))))
@@ -1570,7 +1710,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             texture = self._arrayToTexture(self._signagePanelTexture(bgColor, borderColor))
             panel = self._wallTilePanelActor(
                 "right", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
-            label = self._wallTileLabelActor("right", y, z, WALL_TILE_HEIGHT_M, text)
+            label = self._wallTileLabelActor("right", y, z, WALL_TILE_HEIGHT_M, text, bgColor)
             if enabled and callback is not None:
                 self._wallTileByActor[panel] = _WallTile(
                     panel, (lambda cb=callback: self._activateWallTile(cb)))
@@ -1637,6 +1777,8 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         if renderer is None or self._wallTilePicker is None or not self._wallTileByActor:
             self._setHoveredWallTile(None)
             return None
+        if not self._isFinitePickRay(pos, ori, renderer):
+            return self._hoveredWallTile  # keep the current hover for this one frame
         hit = self._wallTilePicker.Pick3DRay(pos, ori, renderer)
         tile = self._wallTileByActor.get(self._wallTilePicker.GetActor()) if hit else None
         self._setHoveredWallTile(tile)
@@ -2079,22 +2221,25 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         return img
 
     @staticmethod
-    def _textActor(position, heightMeters, color=(0.9, 0.95, 1.0), orientationDeg=(0.0, 0.0, 0.0)):
-        """A vtkTextActor3D authored in physical meters, facing +Z (toward the user) by default -
-        pass orientationDeg to reorient it (e.g. the side-wall tile labels, which need to face
-        into the room instead - see _wallTileLabelActor)."""
-        actor = vtk.vtkTextActor3D()
+    def _textActor(position, heightMeters, color=(0.9, 0.95, 1.0), orientationDeg=(0.0, 0.0, 0.0),
+                   bgColor=(0.0, 0.0, 0.0), ambient=0.9, diffuse=0.1):
+        """An opaque baked-text quad (see _BakedTextMixin) authored in physical meters, facing
+        +Z (toward the user) by default - pass orientationDeg to reorient it (e.g. the side-wall
+        tile labels, which need to face into the room instead - see _wallTileLabelActor).
+        bgColor must be the colour of the panel it sits on; ambient/diffuse default to the
+        panels' own shading so the quad is indistinguishable from the panel behind it."""
+        actor = _BakedTextActor()
+        actor.initText(BAKED_TEXT_FONT_PX, color, bgColor)
+        actor.GetTextProperty().SetJustificationToCentered()
+        actor.GetTextProperty().SetVerticalJustificationToBottom()
         actor.SetInput(" ")
-        tprop = actor.GetTextProperty()
-        tprop.SetFontSize(48)
-        tprop.SetColor(*color)
-        tprop.SetJustificationToCentered()
-        tprop.SetVerticalJustificationToBottom()
-        scale = heightMeters / 48.0
+        prop = actor.GetProperty()
+        prop.SetAmbient(ambient)
+        prop.SetDiffuse(diffuse)
+        scale = heightMeters / float(BAKED_TEXT_FONT_PX)
         actor.SetScale(scale, scale, scale)
         actor.SetPosition(position[0], position[1], position[2])
         actor.SetOrientation(*orientationDeg)
-        actor.PickableOff()
         return actor
 
     def _updateScaleReadout(self) -> None:
@@ -2121,24 +2266,25 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
     def _setSceneViewText(self, name) -> None:
         """Set the scene-view text, truncating (with an ellipsis) only as much as actually
-        needed to fit INFO_SCREEN_NAME_MAX_WIDTH_M - measured via the actor's own rendered
-        bounds, rather than a fixed character count. A fixed count either truncated ordinary
-        short names that had plenty of room left on the screen, or would still overflow on
-        unusually wide characters - this instead fits exactly what the current name needs."""
+        needed to fit INFO_SCREEN_NAME_MAX_WIDTH_M - measured with the text renderer's own
+        metrics (no rasterizing per candidate), rather than a fixed character count. A fixed
+        count either truncated ordinary short names that had plenty of room left on the screen,
+        or would still overflow on unusually wide characters - this instead fits exactly what
+        the current name needs."""
         actor = self._sceneViewTextActor
-        bounds = [0.0] * 6
+        scale = actor.GetScale()[0]
 
         def fits(text) -> bool:
-            actor.SetInput(text)
-            actor.GetBounds(bounds)
-            return bounds[1] - bounds[0] <= INFO_SCREEN_NAME_MAX_WIDTH_M
+            return actor.MeasureWidthPx(text) * scale <= INFO_SCREEN_NAME_MAX_WIDTH_M
 
         if fits(name):
+            actor.SetInput(name)
             return
         truncated = name
         while len(truncated) > 1:
             truncated = truncated[:-1]
             if fits(truncated + "…"):
+                actor.SetInput(truncated + "…")
                 return
         actor.SetInput("…")
 
@@ -2163,34 +2309,28 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # they stay room-fixed instead.
 
     @staticmethod
-    def _billboardTextActor(text, color=ACCENT_COLOR, fontSize=ORIENTATION_LABEL_FONT_SIZE):
-        """A camera-facing, constant-screen-size 3D label anchored at a world/RAS point."""
-        actor = vtk.vtkBillboardTextActor3D()
-        actor.SetInput(text)
+    def _orientationLabelActor(camera, text, color=ACCENT_COLOR, fontSize=ORIENTATION_LABEL_FONT_SIZE):
+        """A camera-facing cut-out letter (baked text, no background - see initText) anchored
+        at a world/RAS point; its world size is set by _updateOrientationLabels from the data.
+        Looks like the vtkBillboardTextActor3D it replaces (bold, shadowed), minus the
+        per-frame translucent-prop cost."""
+        actor = _BakedFollowerTextActor()
+        actor.initText(fontSize, color)
         tprop = actor.GetTextProperty()
-        tprop.SetFontSize(fontSize)
-        tprop.SetColor(*color)
         tprop.SetBold(True)
+        tprop.ShadowOn()
         tprop.SetJustificationToCentered()
         tprop.SetVerticalJustificationToCentered()
-        tprop.ShadowOn()
-        tprop.SetFrameWidth(2)
-        actor.PickableOff()
-
-        # The internal textured quad is lit by default, which tints the label
-        # under Slicer's default light kit. Reach it via GetActors() and unlit it.
-        props = vtk.vtkPropCollection()
-        actor.GetActors(props)
-        quad = props.GetLastProp()
-        if quad is not None:
-            quad.GetProperty().LightingOff()
-
+        actor.SetInput(text)
+        actor.SetCamera(camera)
+        actor.GetProperty().LightingOff()  # reads the same from every side, like a billboard did
         return actor
 
     def _buildOrientationLabels(self, renderer, color) -> None:
         self._orientationLabelActors = {}
+        camera = renderer.GetActiveCamera()
         for letter in ORIENTATION_LABEL_AXES:
-            actor = self._billboardTextActor(letter, color=color)
+            actor = self._orientationLabelActor(camera, letter, color=color)
             renderer.AddViewProp(actor)  # no UserMatrix: authored directly in RAS/world
             self._orientationLabelActors[letter] = actor
         self._updateOrientationLabels()
@@ -2225,6 +2365,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         else:
             radiusXY += ORIENTATION_LABEL_MARGIN_MM
             radiusZ += ORIENTATION_LABEL_MARGIN_MM
+        self._updateOrientationLabelScale()
         for letter, axis in ORIENTATION_LABEL_AXES.items():
             actor = self._orientationLabelActors.get(letter)
             if actor is None:
@@ -2401,17 +2542,38 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         renderWindow = self._renderWindow()
         if renderWindow is None:
             return
+        if not all(math.isfinite(matrix.GetElement(r, c)) for r in range(4) for c in range(4)):
+            # A non-finite world matrix poisons the physical scale, hence the camera clipping
+            # range, hence every subsequent aim-ray pick (see _isFinitePickRay) - never apply one.
+            logging.warning("VRStage: ignoring non-finite PhysicalToWorld matrix")
+            return
+        previousScale = self._matrixScale(self._currentPhysicalToWorld())
         try:
             renderWindow.SetPhysicalToWorldMatrix(matrix)
         except Exception:  # noqa: BLE001
             logging.warning("VRStage: unable to set PhysicalToWorldMatrix")
         self._reanchorChrome(matrix)
+        # Also here, not only in _onPhysicalToWorldModified: the first framing (_resetFraming)
+        # happens before _installObservers connects that signal.
+        self._updateOrientationLabelScale()
         # Changing the physical scale invalidates the camera near/far planes (they are scaled by
         # physicalScale), so recompute them - the same thing SlicerVR's delegate does after a
         # grab/gesture/magnification change. Without this, data is clipped when the scale changes.
-        renderer = self._vrRenderer()
-        if renderer is not None:
-            renderer.ResetCameraClippingRange()
+        # Only on an actual scale change, though: this runs at the input-timer rate while the
+        # turntable spins, and ResetCameraClippingRange (a pass over every prop's bounds) was the
+        # bulk of that tick's ~3 ms - a pure rotation/translation leaves the scale untouched.
+        newScale = self._matrixScale(matrix)
+        if previousScale is None or abs(newScale - previousScale) > 1e-9 * max(newScale, 1e-12):
+            renderer = self._vrRenderer()
+            if renderer is not None:
+                renderer.ResetCameraClippingRange()
+
+    @staticmethod
+    def _matrixScale(matrix):
+        """Uniform scale of a rigid+scale 4x4 (length of its first column), or None."""
+        if matrix is None:
+            return None
+        return vtk.vtkMath.Norm([matrix.GetElement(0, 0), matrix.GetElement(1, 0), matrix.GetElement(2, 0)])
 
     def _reanchorChrome(self, matrix=None) -> None:
         """Keep chrome (UserMatrix == _anchorMatrix / _tableAnchorMatrix) equal to the current
@@ -2531,6 +2693,24 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     def _onPhysicalToWorldModified(self, caller=None, event=None) -> None:
         self._reanchorChrome()
         self._updateScaleReadout()
+        self._updateOrientationLabelScale()
+
+    def _updateOrientationLabelScale(self) -> None:
+        """Keep the R/L/A/P/S/I letters ORIENTATION_LABEL_HEIGHT_M tall in PHYSICAL space. They
+        are world-anchored followers (world units = RAS mm), so without this they would grow and
+        shrink with the magnification like the anatomy does; the physical scale (world units per
+        physical meter) converts the wanted physical height into world units. Called on every
+        physical-to-world change. Without a VR render window (headless tests) VTK's VR default
+        of 1000 world units (mm) per physical meter stands in."""
+        if not self._orientationLabelActors:
+            return
+        renderWindow = self._renderWindow()
+        physicalScale = renderWindow.GetPhysicalScale() if renderWindow is not None else 1000.0
+        if not math.isfinite(physicalScale) or physicalScale <= 0.0:
+            return
+        scale = ORIENTATION_LABEL_HEIGHT_M * physicalScale / float(ORIENTATION_LABEL_FONT_SIZE)
+        for actor in self._orientationLabelActors.values():
+            actor.SetScale(scale, scale, scale)
 
     # ------------------------------------------------------------------ data collection
 
@@ -2846,14 +3026,9 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._reformatMonitorHalfSize = (size / 2.0, size / 2.0)
 
         halfSize = size / 2.0
-        planeSource = vtk.vtkPlaneSource()
-        planeSource.SetOrigin(-halfSize, -halfSize, 0.0)
-        planeSource.SetPoint1(halfSize, -halfSize, 0.0)
-        planeSource.SetPoint2(-halfSize, halfSize, 0.0)
-        planeSource.Update()
-
         modelNode = scene.AddNewNodeByClass("vtkMRMLModelNode", REFORMAT_PLANE_NODE_NAME)
-        modelNode.SetAndObservePolyData(planeSource.GetOutput())
+        modelNode.SetAndObservePolyData(
+            self._squareFramePolyData(halfSize, size * REFORMAT_HANDLE_FRAME_FRAC))
         modelNode.SetHideFromEditors(True)
         modelNode.SetSaveWithScene(False)
         modelNode.CreateDefaultDisplayNodes()
@@ -2861,7 +3036,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         displayNode = modelNode.GetDisplayNode()
         if displayNode is not None:
             displayNode.SetColor(*ACCENT_COLOR)
-            displayNode.SetOpacity(REFORMAT_HANDLE_OPACITY)
+            displayNode.SetOpacity(1.0)  # opaque on purpose - see REFORMAT_HANDLE_FRAME_FRAC
             displayNode.SetBackfaceCulling(False)
             displayNode.SetAmbient(0.9)
             displayNode.SetDiffuse(0.1)
@@ -2905,14 +3080,37 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._reformatCompositeNode = compositeNode
 
         self._reformatMonitorActor = self._buildReformatMonitorActor(self._reformatMonitorHalfSize)
+        # RGB only: the slice pipeline's RGBA output (alpha 0 outside the volume) would make the
+        # screen a translucent prop, and every translucent prop costs milliseconds per frame
+        # under depth peeling - see BAKED_TEXT_DPI. Outside-the-volume area reads black instead.
+        rgb = vtk.vtkImageExtractComponents()
+        rgb.SetInputConnection(sliceLogic.GetExtractModelTexture().GetOutputPort())
+        rgb.SetComponents(0, 1, 2)
         texture = vtk.vtkTexture()
-        texture.SetInputConnection(sliceLogic.GetExtractModelTexture().GetOutputPort())
+        texture.SetInputConnection(rgb.GetOutputPort())
         texture.InterpolateOn()
         self._reformatMonitorActor.SetTexture(texture)
         renderer.AddViewProp(self._reformatMonitorActor)
 
         self._updateReformatFromPlane()
         self._applyReformatVisibility()
+
+    @staticmethod
+    def _squareFramePolyData(halfSize, barWidth):
+        """A flat square frame in the XY plane (+Z normal), centered on the origin: the outer
+        square spans +/-halfSize, the hole +/-(halfSize - barWidth). Four quads, one per side."""
+        outer, inner = halfSize, halfSize - barWidth
+        points = vtk.vtkPoints()
+        for x, y in ((-outer, -outer), (outer, -outer), (outer, outer), (-outer, outer),
+                     (-inner, -inner), (inner, -inner), (inner, inner), (-inner, inner)):
+            points.InsertNextPoint(x, y, 0.0)
+        quads = vtk.vtkCellArray()
+        for a, b in ((0, 1), (1, 2), (2, 3), (3, 0)):  # outer edge a->b, inner edge b+4->a+4
+            quads.InsertNextCell(4, [a, b, b + 4, a + 4])
+        polyData = vtk.vtkPolyData()
+        polyData.SetPoints(points)
+        polyData.SetPolys(quads)
+        return polyData
 
     def _teardownReformatSlice(self) -> None:
         renderer = self._vrRenderer()
@@ -3125,6 +3323,8 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             ori = calldata.GetWorldOrientation()
         except Exception:  # noqa: BLE001
             return
+        if not self._isFinitePickRay(pos, ori, renderer):
+            return  # keep the reticle where it was for this one frame
         hit = self._measurePicker.Pick3DRay(pos, ori, renderer)
         if hit:
             self._measureCurrentHit = tuple(self._measurePicker.GetPickPosition())
@@ -3136,6 +3336,22 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         else:
             self._measureCurrentHit = None
             self._measureReticleActor.VisibilityOff()
+
+    @staticmethod
+    def _isFinitePickRay(pos, ori, renderer) -> bool:
+        """Guard for every per-frame Pick3DRay (reticle and wall tiles). vtkPicker::Pick3DRay
+        builds its ray as pos + farClip * direction(ori), and vtkCellPicker's volume ray-march
+        has no NaN protection: a non-finite ray makes vtkMath::Floor() return INT_MIN for all
+        three voxel indices and the picker reads scalars at index INT_MIN*(1+nx+nx*ny) - an
+        access violation that took the whole application down twice in-headset (both crash
+        dumps held exactly that index). A NaN/inf far clipping plane (from a degenerate
+        physical-to-world matrix or a prop with non-finite bounds) or an invalid pose is
+        therefore checked here, before VTK ever sees it. Picks that hit a healthy volume are
+        fine - 20k+ of them were stress-tested - so volumes stay pickable."""
+        near, far = renderer.GetActiveCamera().GetClippingRange()
+        if not (math.isfinite(near) and math.isfinite(far)) or far <= 0.0:
+            return False
+        return all(math.isfinite(v) for v in pos) and all(math.isfinite(v) for v in ori)
 
     def _commitMeasurementPoint(self, point) -> None:
         """First press creates a new Line markup with both control points at the picked position
