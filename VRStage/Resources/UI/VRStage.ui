@@ -197,7 +197,7 @@
          <string>Colors</string>
         </property>
         <property name="toolTip">
-         <string>Most colors are baked into procedural textures at chrome-build time, so changes here take effect the next time you press Enter VR Stage (not live while already active). Accent color and overhead light color are the exceptions - they update live.</string>
+         <string>All colors update live while the stage is active (most are baked into textures, so the room is rebuilt in place - a brief hitch is normal).</string>
         </property>
         <layout class="QFormLayout" name="colorsLayout">
          <item row="0" column="0">
@@ -462,7 +462,7 @@
          <item>
           <widget class="QCheckBox" name="enableReformatToolCheckBox">
            <property name="toolTip">
-            <string>Enable the grabbable arbitrary reformat plane tool. Disabling it entirely skips setting it up on the next Enter.</string>
+            <string>Enable the grabbable arbitrary reformat plane tool. Applies live: disabling removes the plane and its screen immediately.</string>
            </property>
            <property name="text">
             <string>Enable reformat plane tool</string>
@@ -478,7 +478,7 @@
          <item>
           <widget class="QCheckBox" name="enableMeasurementToolCheckBox">
            <property name="toolTip">
-            <string>Enable the point-to-point measurement tool. Disabling it entirely skips setting it up on the next Enter.</string>
+            <string>Enable the point-to-point measurement tool. Applies live: disabling removes the aiming reticle and cancels any unfinished measurement (completed ones stay in the scene).</string>
            </property>
            <property name="text">
             <string>Enable measurement tool</string>
@@ -509,7 +509,7 @@
       <item row="0" column="0" colspan="2">
        <widget class="QLabel" name="controlBindingsHintLabel">
         <property name="text">
-         <string>Which button triggers each action. Takes effect the next time you press Enter VR Stage.</string>
+         <string>Which button triggers each action. Takes effect immediately, including while the stage is active.</string>
         </property>
         <property name="wordWrap">
          <bool>true</bool>

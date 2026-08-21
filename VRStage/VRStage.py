@@ -1,4 +1,5 @@
 import collections
+import functools
 import logging
 import math
 import time
@@ -624,16 +625,16 @@ class VRStageDisplayOptions:
 
     Colors default to this module's original "medical sci-fi" palette. Most are baked into
     procedural textures at chrome-build time (table screen, walls, floor grid, ceiling panel,
-    signage panels) and therefore only take effect on the *next* enterViewerMode() call - like
-    showWalls/fitToTable, not live while already active. overheadLightColor and accentColor (on
-    the orientation labels only) ARE applied live by applyOptions(), since those are plain
-    vtkLight/actor colors with no baked texture involved.
+    signage panels), so changing one while the stage is active rebuilds the room chrome in place
+    (see VRStageLogic.applyOptions/_rebuildChrome) - every option here applies live, no
+    exit/re-enter needed. overheadLightColor also recolors the light rig directly.
 
-    Visibility flags are read once when the chrome is built (enterViewerMode/_buildChrome) -
-    same next-enter timing as the baked colors above.
+    Visibility flags gate whole prop groups at chrome-build time; flipping one live likewise
+    rebuilds the chrome in place.
 
-    enableReformatTool / enableMeasurementTool skip setting up those tools entirely on the next
-    enterViewerMode() - useful for a module that wants the room/table but not these interactions.
+    enableReformatTool / enableMeasurementTool set up / tear down those tools live (and skip
+    them entirely at enterViewerMode() when off) - useful for a module that wants the room/table
+    but not these interactions.
     """
 
     accentColor: Annotated[qt.QColor, Default(qt.QColor.fromRgbF(*ACCENT_COLOR))]
@@ -666,8 +667,8 @@ class VRStageControlBindings:
     action list/descriptions. Exposed so a user (or another module) can rebind the default
     layout, e.g. to avoid a clash with a button that module's own tooling also wants to use.
 
-    Rebinding only takes effect on the next enterViewerMode() call (observers are installed once
-    per enter, like the rest of this module's options) - not live while already active.
+    Rebinding takes effect immediately while the stage is active (see
+    VRStageLogic._refreshControlBindings) as well as on the next enterViewerMode() call.
 
     Nothing prevents two actions from being assigned to the same button: both fire on press,
     which is rarely useful but not prevented, since validating uniqueness across nine
@@ -969,6 +970,13 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._sceneViewWallPage = 0
         self._sceneViewWallActors = []
 
+        # Live option application (see applyOptions): the snapshot of the options that the live
+        # chrome/tools/framing were last built from, so a parameter-node change can be diffed
+        # against it and only the affected group re-applied; plus a coalescing flag so a burst of
+        # edits (e.g. several color pickers in a row) produces one chrome rebuild, not several.
+        self._appliedOptions = None
+        self._chromeRebuildPending = False
+
     def getParameterNode(self):
         parameterNode = super().getParameterNode()
         if not self._parameterNode or self._parameterNode.parameterNode != parameterNode:
@@ -1090,6 +1098,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._installObservers(widget)
         self._inputTimer.start()
 
+        self._appliedOptions = self._optionsSnapshot(self.getParameterNode())
         self.isActive = True
 
     def exitViewerMode(self) -> None:
@@ -1125,31 +1134,118 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
         self._basePhysicalToWorld = None
         self._savedPhysicalToWorld = None
+        self._appliedOptions = None
+        self._chromeRebuildPending = False
         self.isActive = False
 
     # ------------------------------------------------------------------ options
 
+    # Option fields that drive something built at enter time - diffed by applyOptions against the
+    # snapshot taken when the live state was last built, so only the affected group re-applies:
+    #   CHROME_OPTION_FIELDS  - baked into textures / gate whole prop groups -> _rebuildChrome
+    #   TOOL_OPTION_FIELDS    - the reformat/measurement tools -> live setup/teardown
+    #   FRAMING_OPTION_FIELDS - the framing scale -> _resetFraming
+    # Everything else (controls.*, overheadLight, overheadLightColor on the lights) is applied
+    # directly by applyOptions on every call, unconditionally - cheap and idempotent.
+    CHROME_OPTION_FIELDS = (
+        "accentColor", "accentColorDim", "floorColor", "wallColor", "columnColor", "tableColor",
+        "rimBandColor", "tableScreenBackgroundColor", "overheadLightColor",  # ceiling panel texture
+        "showWalls", "showBackWallSignage", "showTableScreen", "showInfoScreen",
+        "showOrientationLabels", "showAtlasWall", "showSceneViewWall",
+    )
+    TOOL_OPTION_FIELDS = ("enableReformatTool", "enableMeasurementTool")
+    FRAMING_OPTION_FIELDS = ("fitToTable", "defaultScale")
+
+    @classmethod
+    def _optionsSnapshot(cls, params):
+        """Pure helper (headless-testable): a plain dict of every option that needs an explicit
+        rebuild/re-setup step to take effect - see CHROME/TOOL/FRAMING_OPTION_FIELDS. Colors are
+        keyed by their 8-bit hex name (the parameter node already round-trips QColors through
+        that, so comparing by .name() is exactly as precise as the stored value)."""
+        display = params.display
+        snapshot = {}
+        for fieldName in cls.CHROME_OPTION_FIELDS + cls.TOOL_OPTION_FIELDS:
+            value = getattr(display, fieldName)
+            snapshot["display." + fieldName] = value.name() if isinstance(value, qt.QColor) else value
+        for fieldName in cls.FRAMING_OPTION_FIELDS:
+            snapshot[fieldName] = getattr(params, fieldName)
+        return snapshot
+
     def applyOptions(self) -> None:
-        """Re-read options that can change live. Rotation speed / scale step are read on demand.
-        Control bindings (and the back-wall signage describing them) are applied immediately -
-        see _refreshControlBindings - as are overheadLight/display.overheadLightColor and
-        display.accentColor (orientation labels only); every other display.* color/visibility option, plus
-        fitToTable and display.showWalls, only take effect on the next enterViewerMode() call -
-        see VRStageDisplayOptions' docstring for why (most colors are baked into procedural
-        textures at chrome-build time)."""
+        """Apply every option live, while the stage is active. Rotation speed / scale step are
+        read on demand. Control bindings (and the back-wall signage describing them), the
+        overhead-light switch and its color are applied directly. Everything that is built at
+        enter time is diffed against the snapshot it was last built from (_optionsSnapshot) and
+        only the affected group is redone: any baked color or component visibility flag rebuilds
+        the room chrome in place (_rebuildChrome, coalesced over one event-loop tick), the
+        reformat/measurement tool enables set up or tear down that tool, and fitToTable /
+        defaultScale reframe the data. Nothing needs an exit/re-enter any more."""
         if not self.isActive:
             return
         self._refreshControlBindings()
         self._applyLightingOption()
-        display = self.getParameterNode().display
-        overheadColor = _rgbF(display.overheadLightColor)
+        params = self.getParameterNode()
+        overheadColor = _rgbF(params.display.overheadLightColor)
         for light in self._overheadLights:
             light.SetColor(*overheadColor)
-        if self._orientationLabelActors:
-            accentColor = _rgbF(display.accentColor)
-            for actor in self._orientationLabelActors.values():
-                actor.GetTextProperty().SetColor(*accentColor)
-                actor.Rebake()
+
+        snapshot = self._optionsSnapshot(params)
+        previous = self._appliedOptions if self._appliedOptions is not None else {}
+        changed = {key for key, value in snapshot.items() if previous.get(key) != value}
+        self._appliedOptions = snapshot
+        if not changed:
+            return
+
+        if any("display." + f in changed for f in self.CHROME_OPTION_FIELDS):
+            self._scheduleChromeRebuild()
+
+        renderer = self._vrRenderer()
+        if "display.enableReformatTool" in changed and renderer is not None:
+            if params.display.enableReformatTool:
+                self._setupReformatSlice(renderer)
+            else:
+                self._teardownReformatSlice()
+                self._reformatVisible = False
+                self._reformatGripHeldSide = None
+        if "display.enableMeasurementTool" in changed and renderer is not None:
+            if params.display.enableMeasurementTool:
+                self._setupMeasurements(renderer)
+            else:
+                self._teardownMeasurements()
+
+        if any(f in changed for f in self.FRAMING_OPTION_FIELDS):
+            self._resetFraming()
+
+    def _scheduleChromeRebuild(self) -> None:
+        """Coalesce: several option edits arriving in one burst (each firing a parameter-node
+        Modified event) produce a single _rebuildChrome on the next event-loop tick."""
+        if self._chromeRebuildPending:
+            return
+        self._chromeRebuildPending = True
+        qt.QTimer.singleShot(0, self._rebuildChrome)
+
+    def _rebuildChrome(self, renderer=None) -> None:
+        """Tear down and rebuild the whole room chrome in place from the current display
+        options, without exiting VR - the room-wide analogue of _rebuildSceneViewWall. The
+        turntable angle (table-screen spin) and the scene-view wall page are carried across the
+        rebuild; everything else _buildChrome derives fresh (data bounds for the orientation
+        labels, the readouts, the tile picker). Takes an explicit renderer for headless tests
+        (like _buildChrome); otherwise uses the live VR renderer and is a no-op when inactive."""
+        self._chromeRebuildPending = False
+        if not self.isActive:
+            return
+        if renderer is None:
+            renderer = self._vrRenderer()
+        if renderer is None:
+            return
+        turntableAngleRad = self._turntableAngleRad
+        sceneViewWallPage = self._sceneViewWallPage
+        self._teardownChrome()
+        self._turntableAngleRad = turntableAngleRad
+        self._sceneViewWallPage = sceneViewWallPage
+        self._buildChrome(renderer)
+        self._reanchorChrome()
+        self._updateOrientationLabelScale()
 
     # ------------------------------------------------------------------ chrome
 
@@ -1243,7 +1339,8 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             screenProp.SetEmissiveTexture(tableScreenTexture)
             screenProp.SetEmissiveFactor(*TABLE_SCREEN_EMISSIVE_FACTOR)
             tableScreenProps = [self._tableScreenActor]
-        self._turntableAngleRad = 0.0
+        # _turntableAngleRad is deliberately NOT zeroed here: _teardownChrome/enter already do,
+        # and _rebuildChrome carries the live angle across an in-place rebuild.
         self._updateTableScreenOrientation()
 
         # Seam-line trim on the cap's top surface, directly above where the narrower collar ends
@@ -1283,7 +1380,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
         if display.showAtlasWall:
             roomProps.extend(self._buildAtlasWallTiles())
-        self._sceneViewWallPage = 0
+        # _sceneViewWallPage likewise not zeroed here (see _turntableAngleRad above).
         if display.showSceneViewWall:
             self._sceneViewWallActors = self._buildSceneViewWallTiles()
             roomProps.extend(self._sceneViewWallActors)
@@ -2240,13 +2337,16 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         return img
 
     @staticmethod
+    @functools.lru_cache(maxsize=4)
     def _tableScreenTexture(bgColor, ringColor, size=2048):
         """Concentric rings + radial spokes on a dark background - a circuit/targeting-pad look
         for the holo-readout inset in the tabletop. Uses the dim accent (not the full-bright
         accent color) so the pattern stays legible without the table reading as a wash of blue.
         2048 px (vs 512 for the other panels): this is the surface the user leans over, and the
         thin rings/spokes alias badly at lower resolution. Generated once per enter; the numpy
-        pass is ~0.3 s at this size."""
+        pass is ~0.3 s at this size - memoized (args are hashable float tuples) so a live chrome
+        rebuild (_rebuildChrome) that didn't change these two colors doesn't pay it again;
+        _arrayToTexture deep-copies the array, so sharing the cached one is safe."""
         bg = np.array(bgColor) * 255.0
         ring = np.array(ringColor) * 255.0
         img = np.tile(bg.astype(np.uint8), (size, size, 1))
@@ -3757,5 +3857,17 @@ class VRStageTest(ScriptedLoadableModuleTest):
             VRStageLogic.computeDefaultTableHeightM(baseM, 1.0, tallBounds), TABLE_HEIGHT_MIN_M)
         self.assertEqual(
             VRStageLogic.computeDefaultTableHeightM(baseM, 1.0, emptyBounds), TABLE_HEIGHT_M)
+
+        # Live option application: the snapshot applyOptions diffs against is deterministic and
+        # tracks each rebuild-requiring field; applyOptions is a no-op while inactive.
+        params = logic.getParameterNode()
+        snapshot = VRStageLogic._optionsSnapshot(params)
+        self.assertEqual(snapshot, VRStageLogic._optionsSnapshot(params))
+        params.display.showWalls = False
+        self.assertNotEqual(snapshot, VRStageLogic._optionsSnapshot(params))
+        params.display.showWalls = True
+        self.assertEqual(snapshot, VRStageLogic._optionsSnapshot(params))
+        logic.applyOptions()
+        self.assertIsNone(logic._appliedOptions)
 
         self.delayDisplay("Test passed")

@@ -203,6 +203,69 @@ assert enabledLogic._tableScreenActor is not None
 assert enabledLogic._monitorAssembly is not None
 print("VRStageDisplayOptions visibility gating: OK")
 
+# ---------------------------------------------------------------- live option application
+#
+# applyOptions diffs an _optionsSnapshot of the rebuild-requiring options against the one the live
+# state was built from, and _rebuildChrome rebuilds the room in place (carrying the turntable angle
+# and scene-view wall page across) - see VRStage.py's applyOptions/_rebuildChrome. Both are
+# exercisable headlessly: the snapshot is pure, and _rebuildChrome takes an explicit renderer.
+
+liveLogic = VRStage.VRStageLogic()
+liveParams = liveLogic.getParameterNode()
+snapA = VRStage.VRStageLogic._optionsSnapshot(liveParams)
+assert snapA == VRStage.VRStageLogic._optionsSnapshot(liveParams), "snapshot must be deterministic"
+for field in VRStage.VRStageLogic.CHROME_OPTION_FIELDS + VRStage.VRStageLogic.TOOL_OPTION_FIELDS:
+    assert "display." + field in snapA, field
+for field in VRStage.VRStageLogic.FRAMING_OPTION_FIELDS:
+    assert field in snapA, field
+liveParams.display.showInfoScreen = False
+snapB = VRStage.VRStageLogic._optionsSnapshot(liveParams)
+assert snapB != snapA and snapB["display.showInfoScreen"] is False
+liveParams.display.showInfoScreen = True
+liveParams.display.wallColor = qt.QColor(10, 20, 30)
+snapC = VRStage.VRStageLogic._optionsSnapshot(liveParams)
+assert snapC["display.wallColor"] == "#0a141e", snapC["display.wallColor"]
+liveParams.display.wallColor = qt.QColor.fromRgbF(*VRStage.WALL_BASE_COLOR)
+liveParams.defaultScale = 2.5
+assert VRStage.VRStageLogic._optionsSnapshot(liveParams)["defaultScale"] == 2.5
+liveParams.defaultScale = VRStage.DEFAULT_MAGNIFICATION
+assert VRStage.VRStageLogic._optionsSnapshot(liveParams) == snapA, "resets must restore the original snapshot"
+print("_optionsSnapshot: OK")
+
+# applyOptions is a no-op while inactive (no renderer, nothing scheduled, no exception).
+liveLogic.applyOptions()
+assert liveLogic._chromeRebuildPending is False
+assert liveLogic._appliedOptions is None
+
+# _rebuildChrome in place: fewer props after hiding the info screen, no leaked props on the
+# renderer, and the turntable angle / wall page survive the rebuild.
+liveRenderer = vtk.vtkRenderer()
+liveLogic._buildChrome(liveRenderer)
+assert liveLogic._monitorAssembly is not None
+propCountBefore = liveRenderer.GetViewProps().GetNumberOfItems()
+assert propCountBefore == len(liveLogic._chromeProps) + len(liveLogic._orientationLabelActors)
+liveLogic._turntableAngleRad = 0.7
+liveLogic.isActive = True
+liveLogic._appliedOptions = VRStage.VRStageLogic._optionsSnapshot(liveParams)
+# Stub the VR renderer accessor so _rebuildChrome/_teardownChrome use the synthetic renderer.
+liveLogic._vrRenderer = lambda: liveRenderer
+liveParams.display.showInfoScreen = False
+liveLogic._rebuildChrome(liveRenderer)
+assert liveLogic._monitorAssembly is None, "rebuild must honor the new visibility flag"
+assert abs(liveLogic._turntableAngleRad - 0.7) < 1e-12, "turntable angle must survive a rebuild"
+propCountAfter = liveRenderer.GetViewProps().GetNumberOfItems()
+assert propCountAfter == len(liveLogic._chromeProps) + len(liveLogic._orientationLabelActors), \
+    "rebuild leaked props on the renderer"
+assert propCountAfter < propCountBefore
+# Inactive -> no-op, even with an explicit renderer.
+liveLogic.isActive = False
+liveParams.display.showInfoScreen = True
+liveLogic._rebuildChrome(liveRenderer)
+assert liveLogic._monitorAssembly is None, "_rebuildChrome must be a no-op while inactive"
+liveLogic._teardownChrome()
+assert liveRenderer.GetViewProps().GetNumberOfItems() == 0
+print("_rebuildChrome: OK")
+
 # ---------------------------------------------------------------- control bindings
 #
 # VRStageControlBindings (parameter node field "controls") lets a button be reassigned to any
