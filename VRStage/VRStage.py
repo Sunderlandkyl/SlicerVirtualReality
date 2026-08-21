@@ -324,8 +324,14 @@ CONTROL_ACTION_ORDER = [
 # z-fights. The panel border is baked into its texture (see _signagePanelTexture) rather than
 # a second coincident plane, for the same reason.
 BACK_WALL_Z_M = -(ROOM_SIZE_M[2] / 2.0) + 0.05
+# Baked text sits this far in front of its panel. With vtkTextActor3D the text used to float
+# ~4 cm proud (only the glyphs were visible, so the gap never showed); an opaque caption quad
+# that far out reads as a slab hovering in front of the panel in stereo. 1 mm is far beyond the
+# VR depth buffer's resolution at room distances (microns), and the text mappers additionally get
+# a polygon offset toward the viewer (see _BakedTextMixin.initText), so there is no z-fighting.
+BAKED_TEXT_PROUD_M = 0.001
 BACK_WALL_PANEL_OFFSET_M = 0.20   # panel in front of the wall
-BACK_WALL_TEXT_OFFSET_M = 0.24    # text in front of the wall (i.e. ~4cm proud of the panel)
+BACK_WALL_TEXT_OFFSET_M = BACK_WALL_PANEL_OFFSET_M + BAKED_TEXT_PROUD_M
 HELP_PANEL_CENTER_Y_M = ROOM_CENTER_Y_M + 0.35
 HELP_PANEL_WIDTH_M = 2.4
 HELP_TITLE_HEIGHT_M = 0.14
@@ -385,7 +391,7 @@ INFO_SCREEN_NAME_MAX_WIDTH_M = (MONITOR_SCREEN_WIDTH_M * (1.0 - 2.0 * INFO_SCREE
 MONITOR_BEZEL_MARGIN_M = 0.025       # housing overhang beyond the screen face, per side
 MONITOR_HOUSING_DEPTH_M = 0.05
 MONITOR_SCREEN_PROUD_M = 0.006       # screen face proud of the housing shell's front face
-MONITOR_TEXT_PROUD_M = 0.01          # text proud of the screen face
+MONITOR_TEXT_PROUD_M = BAKED_TEXT_PROUD_M  # text proud of the screen face
 MONITOR_MOUNT_PROUD_M = 0.015        # housing pulled proud of the collar's tangent radius
 # RIM_BAND_HEIGHT_M must exceed the housing's bezel-inclusive footprint
 # (INFO_SCREEN_HEIGHT_M + 2*MONITOR_BEZEL_MARGIN_M =~ 0.189m) so it fits inside the collar band
@@ -507,10 +513,11 @@ WALL_TILE_HEIGHT_M = 0.55
 WALL_TILE_GUTTER_M = 0.12
 WALL_TILE_LABEL_HEIGHT_M = 0.045
 WALL_TILE_LABEL_MARGIN_M = 0.03
+WALL_TILE_LABEL_FRAME_PX = 3       # caption-bar outline, in texture pixels at BAKED_TEXT_FONT_PX
 # Proud-of-wall offsets for the tile panel/text, same z-fighting reasoning as
 # BACK_WALL_PANEL_OFFSET_M/BACK_WALL_TEXT_OFFSET_M (side walls are a comparable ~3m from the user).
 WALL_TILE_PANEL_PROUD_M = 0.20
-WALL_TILE_TEXT_PROUD_M = 0.24
+WALL_TILE_TEXT_PROUD_M = WALL_TILE_PANEL_PROUD_M + BAKED_TEXT_PROUD_M
 WALL_TILE_HOVER_COLOR = ACCENT_COLOR
 WALL_TILE_NORMAL_COLOR = (1.0, 1.0, 1.0)
 
@@ -521,7 +528,6 @@ ATLAS_WALL_CENTER_Z_M = TABLE_FORWARD_M
 SCENE_VIEW_WALL_COLUMNS = 3
 SCENE_VIEW_WALL_MAX_ROWS = 3
 SCENE_VIEW_WALL_PAGE_SIZE = SCENE_VIEW_WALL_COLUMNS * SCENE_VIEW_WALL_MAX_ROWS  # tiles per page
-SCENE_VIEW_WALL_CENTER_Y_M = ROOM_CENTER_Y_M
 SCENE_VIEW_WALL_CENTER_Z_M = TABLE_FORWARD_M
 # Prev/page-indicator/Next row below the content grid, shown only when there's more than one page
 # (see _buildSceneViewWallNavTiles). Sized from SCENE_VIEW_WALL_MAX_ROWS (the full page height),
@@ -532,6 +538,13 @@ SCENE_VIEW_WALL_CONTENT_HEIGHT_M = (
 SCENE_VIEW_WALL_NAV_GAP_M = WALL_TILE_GUTTER_M
 SCENE_VIEW_WALL_NAV_ROW_DV_M = (
     -SCENE_VIEW_WALL_CONTENT_HEIGHT_M / 2.0 - SCENE_VIEW_WALL_NAV_GAP_M - WALL_TILE_HEIGHT_M / 2.0)
+# The content grid plus the nav row is ~2.56 m tall in a 3 m room, so unlike the atlas wall it
+# cannot simply be centered at ROOM_CENTER_Y_M - that sank the nav row's bottom (and its
+# captions) 11 cm into the floor. Anchor it from the floor instead: the nav row's bottom edge
+# sits SCENE_VIEW_WALL_FLOOR_CLEARANCE_M above the floor, and the grid's center follows.
+SCENE_VIEW_WALL_FLOOR_CLEARANCE_M = 0.15
+SCENE_VIEW_WALL_CENTER_Y_M = (FLOOR_THICKNESS_M + SCENE_VIEW_WALL_FLOOR_CLEARANCE_M
+                              + WALL_TILE_HEIGHT_M / 2.0 - SCENE_VIEW_WALL_NAV_ROW_DV_M)
 
 # The three atlases from Slicer's own AtlasTests self-test module (Applications/SlicerApp/
 # Testing/Python/AtlasTests.py in Slicer core - not part of this extension) - same fixed
@@ -767,6 +780,9 @@ class _BakedTextMixin:
         self._plane = vtk.vtkPlaneSource()
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(self._plane.GetOutputPort())
+        # Text sits only BAKED_TEXT_PROUD_M off its panel; bias it toward the viewer so it wins
+        # the depth test against the panel even where precision gets marginal.
+        mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-2.0, -2.0)
         if self._cutout:
             # Runs after the texture has been multiplied into gl_FragData[0] (TCoord::Impl),
             # so its alpha is the glyph coverage: drop everything that isn't glyph/shadow.
@@ -848,12 +864,14 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._rightStickPosTag = None
         self._rightStickTouchTag = None
         self._physicalToWorldConnected = False
+        self._installedBindings = None  # see _refreshControlBindings
 
         # Chrome (raw VTK props, not MRML). Anchored to physical space via _anchorMatrix,
         # which is kept equal to the VR PhysicalToWorldMatrix we apply.
         self._chromeProps = []
         self._scaleTextActor = None
         self._sceneViewTextActor = None
+        self._signageBodyActor = None
         self._monitorAssembly = None
         self._anchorMatrix = vtk.vtkMatrix4x4()
         self._tableAnchorMatrix = vtk.vtkMatrix4x4()
@@ -1113,13 +1131,15 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
     def applyOptions(self) -> None:
         """Re-read options that can change live. Rotation speed / scale step are read on demand.
-        overheadLight/display.overheadLightColor and display.accentColor (orientation labels
-        only) are applied immediately here; every other display.* color/visibility option, plus
+        Control bindings (and the back-wall signage describing them) are applied immediately -
+        see _refreshControlBindings - as are overheadLight/display.overheadLightColor and
+        display.accentColor (orientation labels only); every other display.* color/visibility option, plus
         fitToTable and display.showWalls, only take effect on the next enterViewerMode() call -
         see VRStageDisplayOptions' docstring for why (most colors are baked into procedural
         textures at chrome-build time)."""
         if not self.isActive:
             return
+        self._refreshControlBindings()
         self._applyLightingOption()
         display = self.getParameterNode().display
         overheadColor = _rgbF(display.overheadLightColor)
@@ -1247,8 +1267,11 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             roomProps.append(self._roomActor(
                 wallColor, self._arrayToTexture(self._wallPanelTexture(wallColor))))
             roomProps.append(self._ceilingLightActor(columnColor, overheadLightColor))
+        self._signageBodyActor = None
         if display.showBackWallSignage:
-            roomProps.extend(self._backWallSignageActors(display, params.controls))
+            signage = self._backWallSignageActors(display, params.controls)
+            self._signageBodyActor = signage[-1]  # kept live - see _refreshControlBindings
+            roomProps.extend(signage)
 
         if display.showInfoScreen:
             self._monitorAssembly = self._buildMonitorAssembly(display)
@@ -1564,12 +1587,16 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         return actor
 
     @staticmethod
-    def _wallTileLabelActor(side, y, z, height, text, bgColor, color=(0.9, 0.95, 1.0)):
+    def _wallTileLabelActor(side, y, z, height, text, captionBg, frameColor, color=(0.9, 0.95, 1.0)):
         """The tile's name label, held WALL_TILE_TEXT_PROUD_M proud of the wall (a bit further
         than the panel's WALL_TILE_PANEL_PROUD_M, avoiding z-fighting - same reasoning as
         BACK_WALL_TEXT_OFFSET_M vs. BACK_WALL_PANEL_OFFSET_M) and rotated to face into the room -
-        a text quad faces +Z by default, side-wall tiles need it facing +/-X instead. bgColor is
-        the wall colour the label strip is baked over (see _BakedTextMixin)."""
+        a text quad faces +Z by default, side-wall tiles need it facing +/-X instead.
+
+        Styled as a caption bar - light text on the dark captionBg with a frameColor outline
+        (both baked into the texture by the text renderer) - so it reads the same over a pale
+        atlas tile, a scene-view screenshot of any brightness, or the bare wall; plain text baked
+        over the wall colour was white-on-white."""
         if side == "left":
             labelX = -ROOM_SIZE_M[0] / 2.0 + WALL_TILE_TEXT_PROUD_M
             orientationDeg = (0.0, 90.0, 0.0)
@@ -1578,8 +1605,12 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             orientationDeg = (0.0, -90.0, 0.0)
         actor = VRStageLogic._textActor(
             (labelX, y - height / 2.0 + WALL_TILE_LABEL_MARGIN_M, z),
-            WALL_TILE_LABEL_HEIGHT_M, color=color, orientationDeg=orientationDeg, bgColor=bgColor)
-        actor.SetInput(text)
+            WALL_TILE_LABEL_HEIGHT_M, color=color, orientationDeg=orientationDeg, bgColor=captionBg)
+        tprop = actor.GetTextProperty()
+        tprop.SetFrame(True)
+        tprop.SetFrameColor(*frameColor)
+        tprop.SetFrameWidth(WALL_TILE_LABEL_FRAME_PX)
+        actor.SetInput(text)  # first real bake, with the frame in place
         return actor
 
     @staticmethod
@@ -1604,6 +1635,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         display = self.getParameterNode().display
         bgColor = _rgbF(display.wallColor)
         borderColor = _rgbF(display.accentColor)
+        captionBg = _rgbF(display.tableScreenBackgroundColor)
         offsets = self._gridTileOffsets(
             len(ATLAS_SPECS), ATLAS_WALL_COLUMNS, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M,
             WALL_TILE_GUTTER_M)
@@ -1614,7 +1646,8 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             texture = self._arrayToTexture(self._atlasTileTexture(atlasSpec["kind"], bgColor, borderColor))
             panel = self._wallTilePanelActor(
                 "left", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
-            label = self._wallTileLabelActor("left", y, z, WALL_TILE_HEIGHT_M, atlasSpec["name"], bgColor)
+            label = self._wallTileLabelActor(
+                "left", y, z, WALL_TILE_HEIGHT_M, atlasSpec["name"], captionBg, borderColor)
             self._wallTileByActor[panel] = _WallTile(
                 panel, (lambda spec=atlasSpec: self._activateWallTile(
                     lambda s=spec: self._activateAtlasTile(s))))
@@ -1630,6 +1663,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         display = self.getParameterNode().display
         bgColor = _rgbF(display.wallColor)
         borderColor = _rgbF(display.accentColor)
+        captionBg = _rgbF(display.tableScreenBackgroundColor)
         logic = self._sceneViewsLogic()
         totalCount = logic.GetNumberOfSceneViews() if logic is not None else 0
 
@@ -1643,7 +1677,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
                 "right", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
             panel.PickableOff()  # placeholder only - not a real, activatable tile
             label = self._wallTileLabelActor(
-                "right", y, z, WALL_TILE_HEIGHT_M, _("No scene views saved"), bgColor)
+                "right", y, z, WALL_TILE_HEIGHT_M, _("No scene views saved"), captionBg, borderColor)
             return [panel, label]
 
         pageCount = math.ceil(totalCount / SCENE_VIEW_WALL_PAGE_SIZE)
@@ -1670,7 +1704,8 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             panel = self._wallTilePanelActor(
                 "right", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
             name = logic.GetNthSceneViewName(index) or _("(unnamed)")
-            label = self._wallTileLabelActor("right", y, z, WALL_TILE_HEIGHT_M, name, bgColor)
+            label = self._wallTileLabelActor(
+                "right", y, z, WALL_TILE_HEIGHT_M, name, captionBg, borderColor)
             self._wallTileByActor[panel] = _WallTile(
                 panel, (lambda i=index: self._activateWallTile(
                     lambda idx=i: self._activateSceneViewTile(idx))))
@@ -1691,6 +1726,7 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         display = self.getParameterNode().display
         bgColor = _rgbF(display.wallColor)
         accentColor = _rgbF(display.accentColor)
+        captionBg = _rgbF(display.tableScreenBackgroundColor)
         navOffsets = self._gridTileOffsets(
             3, SCENE_VIEW_WALL_COLUMNS, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, WALL_TILE_GUTTER_M)
         currentPage = self._sceneViewWallPage
@@ -1710,7 +1746,8 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             texture = self._arrayToTexture(self._signagePanelTexture(bgColor, borderColor))
             panel = self._wallTilePanelActor(
                 "right", x, y, z, WALL_TILE_WIDTH_M, WALL_TILE_HEIGHT_M, texture)
-            label = self._wallTileLabelActor("right", y, z, WALL_TILE_HEIGHT_M, text, bgColor)
+            label = self._wallTileLabelActor(
+                "right", y, z, WALL_TILE_HEIGHT_M, text, captionBg, borderColor)
             if enabled and callback is not None:
                 self._wallTileByActor[panel] = _WallTile(
                     panel, (lambda cb=callback: self._activateWallTile(cb)))
@@ -2203,10 +2240,13 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         return img
 
     @staticmethod
-    def _tableScreenTexture(bgColor, ringColor, size=512):
+    def _tableScreenTexture(bgColor, ringColor, size=2048):
         """Concentric rings + radial spokes on a dark background - a circuit/targeting-pad look
         for the holo-readout inset in the tabletop. Uses the dim accent (not the full-bright
-        accent color) so the pattern stays legible without the table reading as a wash of blue."""
+        accent color) so the pattern stays legible without the table reading as a wash of blue.
+        2048 px (vs 512 for the other panels): this is the surface the user leans over, and the
+        thin rings/spokes alias badly at lower resolution. Generated once per enter; the numpy
+        pass is ~0.3 s at this size."""
         bg = np.array(bgColor) * 255.0
         ring = np.array(ringColor) * 255.0
         img = np.tile(bg.astype(np.uint8), (size, size, 1))
@@ -3514,6 +3554,9 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         # to whatever button is currently configured for it - or skip it entirely if it's
         # deliberately left Unbound (see CONTROL_BINDING_UNBOUND).
         controls = self.getParameterNode().controls
+        # Snapshot of what is bound right now, so _refreshControlBindings can tell a real rebind
+        # from any other parameter-node change.
+        self._installedBindings = self._bindingSnapshot(controls)
 
         def addAction(fieldName, callback):
             label = getattr(controls, fieldName)
@@ -3559,11 +3602,33 @@ class VRStageLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         widget.connect("physicalToWorldMatrixModified()", self._onPhysicalToWorldModified)
         self._physicalToWorldConnected = True
 
+    @staticmethod
+    def _bindingSnapshot(controls):
+        return {fieldName: getattr(controls, fieldName) for fieldName, _description in CONTROL_ACTION_ORDER}
+
+    def _refreshControlBindings(self) -> None:
+        """Make a rebind in the Controls UI take effect immediately while the stage is active:
+        the back-wall signage re-bakes its control-scheme text (a no-op when unchanged), and if
+        any action moved to a different button the interactor observers are torn down and
+        re-installed against the new bindings - previously both only happened on the next
+        enterViewerMode()."""
+        controls = self.getParameterNode().controls
+        if self._signageBodyActor is not None:
+            self._signageBodyActor.SetInput(self._controlSchemeBodyText(controls))
+        if self._installedBindings is None or self._bindingSnapshot(controls) == self._installedBindings:
+            return
+        widget = self._vrViewWidget()
+        if widget is None:
+            return
+        self._removeObservers()
+        self._installObservers(widget)
+
     def _removeObservers(self) -> None:
         self.removeObservers()
         self._rightStickPosTag = None
         self._rightStickTouchTag = None
         self._interactor = None
+        self._installedBindings = None
 
         widget = self._vrViewWidget()
         if widget is not None and self._physicalToWorldConnected:
