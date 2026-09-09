@@ -170,6 +170,30 @@ public:
     LAST_CONTROLLER_EVENT
   };
 
+  ///@{
+  /// Convert between a ControllerEvents value and its name (e.g. "RightGripClickEvent").
+  ///
+  /// vtkCommand::GetStringFromEventId() only knows VTK's built-in events and returns "NoEvent"
+  /// for these custom event IDs. This is also what VTK's Python observer bridge uses, so the
+  /// "event" argument passed to a Python observer callback is always "NoEvent" for a
+  /// ControllerEvents value. The event ID is available from the call data instead:
+  /// vtkOpenXRRenderWindowInteractor stores it in vtkEventData::GetType() before invoking the
+  /// event, so a single callback observing several controller events can tell them apart with
+  ///
+  ///   eventName = vtkVirtualRealityViewOpenXRInteractorStyle.GetStringFromControllerEventId(calldata.GetType())
+  ///
+  /// Note that when ProcessControllerEvents() translates a controller event into a default VTK
+  /// 3D event (e.g. RightGripClickEvent -> PositionProp3DEvent), the call data is forwarded
+  /// unchanged, so GetType() still identifies the physical control that triggered it.
+  ///
+  /// GetStringFromControllerEventId() returns "NoEvent" for IDs outside ControllerEvents, and
+  /// GetControllerEventIdFromString() returns vtkCommand::NoEvent for unknown names.
+  static const char* GetStringFromControllerEventId(unsigned long eventId);
+  static unsigned long GetControllerEventIdFromString(const char* eventName);
+  /// Return true if eventId is one of the ControllerEvents values.
+  static bool IsControllerEvent(unsigned long eventId);
+  ///@}
+
   /// Register the generic per-control actions with the interactor.
   /// Overrides vtkOpenXRInteractorStyle::SetupActions(), which otherwise registers
   /// the legacy curated action set (elevation, movement, nextcamerapose,

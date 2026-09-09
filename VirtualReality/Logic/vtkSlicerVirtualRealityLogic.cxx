@@ -674,7 +674,7 @@ void vtkSlicerVirtualRealityLogic::SetGestureButtonToNone(vtkVRRenderWindowInter
 
 //-----------------------------------------------------------------------------
 /*static*/ void vtkSlicerVirtualRealityLogic::InvokeEvent(
-  vtkVRRenderWindowInteractor* rwi, const vtkCommand::EventIds& eventId, vtkEventData* edata)
+  vtkVRRenderWindowInteractor* rwi, unsigned long eventId, vtkEventData* edata)
 {
   if (!rwi)
   {

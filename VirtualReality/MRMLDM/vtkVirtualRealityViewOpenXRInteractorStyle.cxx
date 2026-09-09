@@ -27,6 +27,65 @@
 // VTK includes
 #include <vtkObjectFactory.h>
 
+// STD includes
+#include <cstring>
+
+namespace
+{
+// Names of the ControllerEvents values, in enum order (index = eventId - FIRST_CONTROLLER_EVENT).
+// Keep in sync with the ControllerEvents enum in the header; the static_assert below catches
+// a mismatch in the number of entries.
+const char* const ControllerEventNames[] =
+{
+  "LeftGripPoseEvent",
+  "RightGripPoseEvent",
+  "LeftAimPoseEvent",
+  "RightAimPoseEvent",
+
+  "LeftGripValueEvent",
+  "RightGripValueEvent",
+  "LeftGripClickEvent",
+  "RightGripClickEvent",
+  "LeftTriggerValueEvent",
+  "RightTriggerValueEvent",
+  "LeftTriggerClickEvent",
+  "RightTriggerClickEvent",
+  "LeftTriggerTouchEvent",
+  "RightTriggerTouchEvent",
+
+  "LeftThumbstickEvent",
+  "RightThumbstickEvent",
+  "LeftThumbstickClickEvent",
+  "RightThumbstickClickEvent",
+  "LeftThumbstickTouchEvent",
+  "RightThumbstickTouchEvent",
+
+  "LeftThumbrestTouchEvent",
+  "RightThumbrestTouchEvent",
+
+  "LeftButton1ClickEvent",
+  "LeftButton1TouchEvent",
+  "LeftButton2ClickEvent",
+  "LeftButton2TouchEvent",
+  "LeftMenuClickEvent",
+
+  "RightButton1ClickEvent",
+  "RightButton1TouchEvent",
+  "RightButton2ClickEvent",
+  "RightButton2TouchEvent",
+  "RightSystemClickEvent",
+
+  "LeftSystemClickEvent",
+  "RightMenuClickEvent",
+};
+constexpr unsigned long NumberOfControllerEvents =
+  sizeof(ControllerEventNames) / sizeof(ControllerEventNames[0]);
+static_assert(NumberOfControllerEvents ==
+  vtkVirtualRealityViewOpenXRInteractorStyle::LAST_CONTROLLER_EVENT
+  - vtkVirtualRealityViewOpenXRInteractorStyle::FIRST_CONTROLLER_EVENT,
+  "ControllerEventNames must list every ControllerEvents value, in enum order");
+}
+
 //----------------------------------------------------------------------------
 vtkStandardNewMacro(vtkVirtualRealityViewOpenXRInteractorStyle);
 
@@ -173,4 +232,37 @@ void vtkVirtualRealityViewOpenXRInteractorStyle::OnPositionProp3D(vtkEventData* 
   default:
     break;
   }
+}
+
+//----------------------------------------------------------------------------
+bool vtkVirtualRealityViewOpenXRInteractorStyle::IsControllerEvent(unsigned long eventId)
+{
+  return eventId >= FIRST_CONTROLLER_EVENT && eventId < LAST_CONTROLLER_EVENT;
+}
+
+//----------------------------------------------------------------------------
+const char* vtkVirtualRealityViewOpenXRInteractorStyle::GetStringFromControllerEventId(unsigned long eventId)
+{
+  if (!vtkVirtualRealityViewOpenXRInteractorStyle::IsControllerEvent(eventId))
+  {
+    return "NoEvent";
+  }
+  return ControllerEventNames[eventId - FIRST_CONTROLLER_EVENT];
+}
+
+//----------------------------------------------------------------------------
+unsigned long vtkVirtualRealityViewOpenXRInteractorStyle::GetControllerEventIdFromString(const char* eventName)
+{
+  if (!eventName)
+  {
+    return vtkCommand::NoEvent;
+  }
+  for (unsigned long index = 0; index < NumberOfControllerEvents; ++index)
+  {
+    if (strcmp(ControllerEventNames[index], eventName) == 0)
+    {
+      return FIRST_CONTROLLER_EVENT + index;
+    }
+  }
+  return vtkCommand::NoEvent;
 }

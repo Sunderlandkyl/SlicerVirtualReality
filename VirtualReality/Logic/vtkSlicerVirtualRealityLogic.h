@@ -202,8 +202,11 @@ public:
   /// This is necessary because vtkObject::InvokeEvent(unsigned long, void*) takes its call data
   /// as a void*, which Python cannot pass a wrapped vtkObject as; routing the call data through
   /// this method instead (whose call data parameter is a proper vtkEventData*) avoids that.
+  /// The event ID is a plain unsigned long (rather than vtkCommand::EventIds) so that custom
+  /// event IDs, such as vtkVirtualRealityViewOpenXRInteractorStyle::ControllerEvents values,
+  /// can be passed from Python as well as the vtkCommand constants.
   /// Example: InvokeEvent(rwi, vtkCommand::ViewerMovement3DEvent, calldata)
-  static void InvokeEvent(vtkVRRenderWindowInteractor* rwi, const vtkCommand::EventIds& eventId, vtkEventData* edata);
+  static void InvokeEvent(vtkVRRenderWindowInteractor* rwi, unsigned long eventId, vtkEventData* edata);
 
   /// Initialize the active Virtual Reality view node.
   ///

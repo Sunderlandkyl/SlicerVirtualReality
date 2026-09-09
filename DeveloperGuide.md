@@ -148,13 +148,23 @@ interactorStyle = interactor.GetInteractorStyle()
 highPriority = 100.0
 
 # Every physical control fires its own raw ControllerEvents value independently, whether or not it is also
-# translated into a default VTK 3D event. Observe the right grip's click/squeeze directly, with no remapping needed:
+# translated into a default VTK 3D event. Observe the right grip's click/squeeze directly, with no remapping needed.
+#
+# Note: the "event" argument of the callback is always "NoEvent" for ControllerEvents, because VTK's Python
+# observer bridge names events with vtkCommand::GetStringFromEventId(), which only knows VTK's built-in events.
+# Use the event ID stored in the call data instead: calldata.GetType() is the ControllerEvents value that
+# triggered the callback, and GetStringFromControllerEventId() converts it to its name. This makes it possible
+# to use a single callback for several events:
+
+InteractorStyle = vtkSlicerVirtualRealityModuleMRMLDisplayableManager.vtkVirtualRealityViewOpenXRInteractorStyle
 
 @vtk.calldata_type(vtk.VTK_OBJECT)
-def onRightGripClickEvent(caller, event, calldata):
-    print(f"RightTriggerClickEvent received, action={calldata.GetAction()}")
+def onControllerEvent(caller, event, calldata):
+    eventName = InteractorStyle.GetStringFromControllerEventId(calldata.GetType())
+    print(f"{eventName} received, action={calldata.GetAction()}")
 
-interactor.AddObserver(vtkSlicerVirtualRealityModuleMRMLDisplayableManager.vtkVirtualRealityViewOpenXRInteractorStyle.RightTriggerClickEvent, onRightGripClickEvent, highPriority)
+interactor.AddObserver(InteractorStyle.RightGripClickEvent, onControllerEvent, highPriority)
+interactor.AddObserver(InteractorStyle.RightTriggerClickEvent, onControllerEvent, highPriority)
 
 # To override a button that is already used for some default action, we can set the abort flag.
 # For example, here we take over the right hand joystick that is used for flying by default.
@@ -266,6 +276,8 @@ For OpenXR, `complexgestureaction` is bound to the left X button and the right A
 ### Low-level interception of events
 
 For implementing completely custom behavior, any VTK event — including the raw, per-control `ControllerEvents` that are always independently observable — can be intercepted on the render window interactor by adding a high-priority observer.
+
+The `event` argument passed to a Python observer callback is `"NoEvent"` for every `ControllerEvents` value: VTK's Python observer bridge names events with `vtkCommand::GetStringFromEventId()`, which only knows VTK's built-in events. To tell events apart in a shared callback, use the event ID that `vtkOpenXRRenderWindowInteractor` stores in the call data before invoking the event (`calldata.GetType()`), and convert it to a name with `vtkVirtualRealityViewOpenXRInteractorStyle.GetStringFromControllerEventId()` (the inverse is `GetControllerEventIdFromString()`). When a controller event is translated into a default VTK 3D event by `ProcessControllerEvents()` the call data is forwarded unchanged, so `calldata.GetType()` still identifies the physical control that triggered it (e.g. `RightGripClickEvent` inside a `PositionProp3DEvent` observer).
 
 It is also possible to invoke a VTK event with event data from a Python observer callback, e.g. to assign a default action (like flying) to another control, by calling `slicer.modules.virtualreality.logic().InvokeEvent()`. This wrapper is necessary because `vtkObject::InvokeEvent(unsigned long, void*)`'s call data parameter is a `void*`, which Python cannot pass a wrapped `vtkObject` as; `InvokeEvent()`'s call data parameter is a proper `vtkEventData*`, avoiding that conversion problem.
 
