@@ -164,6 +164,26 @@ void vtkMRMLVirtualRealityViewNode::Copy(vtkMRMLNode* anode)
 }
 
 //----------------------------------------------------------------------------
+void vtkMRMLVirtualRealityViewNode::Reset(vtkMRMLNode* defaultNode)
+{
+  if (defaultNode && !vtkMRMLVirtualRealityViewNode::SafeDownCast(defaultNode))
+  {
+    // Not a VR view node (e.g. the default 3D view node applied by
+    // vtkSlicerViewControllersLogic::ResetAllViewNodesToDefault() to all vtkMRMLViewNode
+    // subclasses): that reset is not meant for this node, so leave it untouched. Falling back
+    // to this class's built-in defaults would discard the settings applied from the module's
+    // own default node (e.g. the XR backend).
+    return;
+  }
+  // Visibility is the headset connection state; a reset must not change it.
+  int visibility = this->GetVisibility();
+  int wasModifying = this->StartModify();
+  this->Superclass::Reset(defaultNode);
+  this->SetVisibility(visibility);
+  this->EndModify(wasModifying);
+}
+
+//----------------------------------------------------------------------------
 void vtkMRMLVirtualRealityViewNode::PrintSelf(ostream& os, vtkIndent indent)
 {
   this->Superclass::PrintSelf(os, indent);
